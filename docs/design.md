@@ -1,6 +1,6 @@
 # verus-gpu-transpiler: Design Document
 
-**Status**: Draft v2, open for iteration  
+**Status**: Draft v3 (final review pass)  
 **Last updated**: 2026-04-03
 
 ## 1. Motivation
@@ -72,7 +72,7 @@ CompCert-style verified compilation, with equivalent guarantees.
 |----------|---------------|--------|----------------|
 | **Verified compiler** (CompCert) | Compiler correct for ALL inputs | Enormous (100K+ lines Coq) | Proof checker + source/target semantics |
 | **Translation validation** (Alive2) | This PARTICULAR output matches input | Per-compilation check | Validator + source/target semantics |
-| **Our approach** | Structural map preserves eval semantics | Small (~50 lines proof per AST variant) | Verus + source/target semantics + string emission |
+| **Our approach** | Structural map preserves eval semantics | Moderate (~600 lines total, structural induction) | Verus + source/target semantics + string rendering |
 
 Our transpiler is a *structural map* — each source AST node maps to exactly one
 target AST node. Proving this preserves semantics is a simple structural
@@ -144,11 +144,12 @@ variant, proved once, covers all well-formed programs.
 
 | Component | Status | Size |
 |-----------|--------|------|
-| GpuIR types + eval semantics | **Verified** | ~400 lines |
-| GpuIR well-formedness / overflow | **Verified** | ~200 lines |
-| Emit correctness (general, all programs) | **Verified** | ~300 lines |
-| tree-sitter front-end | Trusted | ~300 lines |
-| WGSL string rendering | Trusted | ~80 lines |
+| GpuIR types + eval semantics | **Verified** | ~1000 lines |
+| GpuIR well-formedness + safety | **Verified** | ~400 lines |
+| `wgsl_semantics` + emit correctness proof | **Verified** | ~600 lines |
+| Performance property specs (coalescing, bank conflicts) | **Verified** | ~200 lines |
+| tree-sitter front-end | Trusted | ~700 lines |
+| WGSL string rendering | Trusted | ~150 lines |
 | naga/tint (WGSL → SPIR-V) | Trusted | — |
 | GPU driver + silicon | Trusted | — |
 
@@ -172,103 +173,71 @@ satisfies its spec (standard Verus). The parser (trusted) connects them.
 
 ### 4.1 Types
 
+See **Section 8.4** for the complete, authoritative GpuIR type definitions
+(updated after the hardware faithfulness audit). Key types:
+
+- **ScalarType**: `I32, U32, F32, F16, Bool`
+- **GpuType**: `Scalar(ScalarType), Vec2/3/4(ScalarType), Mat{cols,rows}, Void`
+- **GpuValue**: `Int, Float, Half, Bool, Vec, Mat` — spec-level value model
+- **GpuExpr** (~25 variants): constants, vars, builtins, arithmetic,
+  memory access, function calls, casts, vector/matrix ops, packed types,
+  subgroup ops
+- **GpuStmt** (~12 variants): `Assign, BufWrite, TextureStore, AtomicRMW,
+  Block, If, For, Break, Continue, Barrier, Return, Noop`
+- **GpuKernel**: typed buffer/texture bindings with `MemorySpace`, helper
+  functions, body, workgroup_size, feature flags
+- **GpuBinOp** includes wrapping variants (`WrappingAdd`, etc.) for
+  faithful-to-hardware wrapping arithmetic
+
+### 4.2 Value model
+
+GpuIR has multiple types (scalars, vectors, matrices). The spec-level value
+type represents all possible runtime values:
+
 ```rust
-/// Type tag for GpuIR values — maps directly to WGSL types.
-pub enum GpuType { I32, U32, F32 }
-
-pub enum GpuBinOp {
-    // Integer arithmetic
-    Add, Sub, Mul, Div, Mod, Shr,
-    // Comparisons (return i32: 1 or 0)
-    Lt, Le, Gt, Ge, Eq, Ne,
-    // Bitwise (integer only)
-    BitAnd, BitOr, BitXor,
-    // Float arithmetic (same names, dispatched by GpuType)
-    FAdd, FSub, FMul, FDiv,
-}
-
-pub enum GpuExpr {
-    Const(int),                                         // integer constant
-    FConst(f32),                                        // float constant
-    Var(nat),                                           // locals[i]
-    BinOp(GpuBinOp, Box<GpuExpr>, Box<GpuExpr>),
-    Select(Box<GpuExpr>, Box<GpuExpr>, Box<GpuExpr>),  // c != 0 ? a : b
-    ArrayRead(nat, Box<GpuExpr>),                       // bufs[arr][idx]
-    Call(nat, Seq<GpuExpr>),                            // fn_table[id](args)
-    Cast(GpuType, Box<GpuExpr>),                        // type cast (e.g., i32 → f32)
-}
-
-/// Barrier scope — matches hardware synchronization primitives.
-pub enum BarrierScope {
-    /// workgroupBarrier() — all threads in workgroup sync.
-    /// Cheapest (~20 cycles). Most common.
-    Workgroup,
-    /// storageBarrier() — ensures storage buffer writes are visible
-    /// to subsequent reads within the workgroup.
-    Storage,
-    /// Subgroup-level barrier (warp sync). Not available in all
-    /// WGSL implementations; maps to __syncwarp() in CUDA.
-    Subgroup,
-}
-
-pub enum GpuStmt {
-    Assign { var: nat, rhs: GpuExpr },
-    BufWrite { buf: nat, idx: GpuExpr, val: GpuExpr },
-    Seq { first: Box<GpuStmt>, then: Box<GpuStmt> },
-    If { cond: GpuExpr, then_body: Box<GpuStmt>, else_body: Box<GpuStmt> },
-    For { var: nat, bound: GpuExpr, body: Box<GpuStmt> },
-    Barrier { scope: BarrierScope },
-    Return,
-    Noop,
-}
-
-pub struct GpuFunction {
-    pub params: Seq<nat>,       // which locals are parameters
-    pub body: GpuStmt,
-    pub ret_var: nat,           // which local holds the return value
-}
-
-pub struct GpuKernel {
-    pub n_locals: nat,
-    pub n_bufs: nat,
-    pub functions: Seq<GpuFunction>,   // helper functions
-    pub body: GpuStmt,
-    pub thread_dim: ThreadDim,
-    pub workgroup_size: (nat, nat, nat),
+pub enum GpuValue {
+    Int(int),                                   // i32, u32
+    Float(f32),                                 // f32
+    Half(f32),                                  // f16 (stored as f32 in spec)
+    Bool(bool),
+    Vec(Seq<GpuValue>),                         // vec2..vec4 (2-4 components)
+    Mat(Seq<Seq<GpuValue>>),                    // mat columns (2-4 cols of vec)
 }
 ```
 
-### 4.2 Eval semantics
-
-State model (extends ArithExpr's env + arrays):
+State model:
 
 ```rust
 pub struct GpuState {
-    pub locals: Seq<int>,
-    pub bufs: Seq<Seq<int>>,
+    pub locals: Seq<GpuValue>,                  // typed local variables
+    pub bufs: Seq<Seq<GpuValue>>,               // buffer contents
     pub returned: bool,
 }
 ```
 
-Expression eval — pure, follows `arith_eval_with_arrays` pattern:
+### 4.3 Eval semantics
+
+Expression eval — returns `GpuValue`:
 
 ```rust
-spec fn gpu_eval_expr(e: &GpuExpr, locals: Seq<int>, bufs: Seq<Seq<int>>,
-                      fns: Seq<GpuFunction>) -> int
+spec fn gpu_eval_expr(e: &GpuExpr, state: &GpuState,
+                      fns: &Seq<GpuFunction>) -> GpuValue
 ```
 
 Statement eval — follows `staged_eval` / `eval_loop` pattern:
 
 ```rust
-spec fn gpu_eval_stmt(s: &GpuStmt, state: GpuState, fns: Seq<GpuFunction>) -> GpuState
+spec fn gpu_eval_stmt(s: &GpuStmt, state: GpuState,
+                      fns: &Seq<GpuFunction>) -> GpuState
 ```
 
 Key semantics:
 - `Assign`: update `locals[var]`
-- `BufWrite`: update `bufs[buf][eval(idx)]`
-- `Seq`: eval first, then eval second (unless returned)
-- `If`: branch on `eval(cond) != 0`
-- `For`: bounded loop via `gpu_eval_loop` (mutual recursion, same as `eval_loop` in stage.rs)
+- `BufWrite`: update `bufs[buf][eval(idx)]` (idx evaluates to Int)
+- `Block`: eval statements left to right (unless returned)
+- `If`: branch on `eval(cond)` being truthy (non-zero int or true bool)
+- `For`: bounded loop via `gpu_eval_loop` (mutual recursion, same as
+  `eval_loop` in stage.rs). Supports `start..end` range.
 - `Barrier`: spec-level no-op on per-thread state (like Stage::Barrier).
   The barrier's effect is at the *parallel* level — it's the point where
   all threads' writes become visible. The Stage framework handles this:
@@ -276,13 +245,16 @@ Key semantics:
   phase is verified independently for race freedom. The barrier scope
   determines which threads synchronize (workgroup vs storage vs subgroup).
 - `Call`: substitute args into function body, eval, extract return value
+- `Break`: exit innermost loop (set a `broken` flag in eval state)
+- `Continue`: skip to next iteration
 - `Return`: set `returned = true`
 
-### 4.3 Well-formedness
+### 4.4 Well-formedness
 
-- `gpu_expr_wf(e, n_locals, n_bufs)` — structural (indices in range)
-- `gpu_expr_fits_i64(e, locals, bufs)` — overflow safety (all intermediates in i64)
-- `gpu_stmt_safe(s, state)` — runtime safety through execution
+- `gpu_expr_wf(e, n_locals, n_bufs)` — structural (indices in range, types match)
+- `gpu_expr_safe(e, state)` — runtime safety: integer overflow (for
+  non-wrapping ops), float finiteness (for `add_req`), array bounds
+- `gpu_stmt_safe(s, state)` — runtime safety propagated through execution
 
 ### 4.4 Backward compatibility
 
@@ -323,27 +295,27 @@ We define a spec function `emit_expr_correct` that expresses the structural
 correspondence, then prove it by induction:
 
 ```rust
-/// The WGSL text for an expression computes the same value as gpu_eval_expr.
-/// This is the KEY theorem — proved once, covers all expressions.
-proof fn lemma_emit_expr_preserves_eval(e: &GpuExpr)
+/// GpuIR eval and WGSL semantics agree on all well-formed expressions.
+/// KEY theorem — proved once by structural induction, covers all programs.
+proof fn lemma_eval_matches_wgsl(e: &GpuExpr)
     requires gpu_expr_wf(e, n_locals, n_bufs)
     ensures
-        // For all environments where the expression is safe:
-        forall |locals: Seq<int>, bufs: Seq<Seq<int>>|
-            gpu_expr_fits_i64(e, locals, bufs) ==>
-            wgsl_interp(emit_expr(e), locals, bufs) == gpu_eval_expr(e, locals, bufs)
+        forall |state: &GpuState|
+            gpu_expr_safe(e, state) ==>
+            wgsl_semantics_expr(e, state) == gpu_eval_expr(e, state, &seq![])
     decreases e
 {
     match e {
-        GpuExpr::Const(c) => {},                    // emit "42" → interprets as 42 ✓
-        GpuExpr::Var(i) => {},                      // emit "v_i" → interprets as locals[i] ✓
-        GpuExpr::BinOp(op, a, b) => {               // emit "(a + b)" → interp = eval(a) + eval(b)
-            lemma_emit_expr_preserves_eval(a);       //   by IH on a
-            lemma_emit_expr_preserves_eval(b);       //   by IH on b
+        GpuExpr::Const(c, _) => {},                  // both return GpuValue::Int(c) ✓
+        GpuExpr::Var(i, _) => {},                     // both return state.locals[i] ✓
+        GpuExpr::BinOp(op, a, b) => {                 // both apply op to sub-evals
+            lemma_eval_matches_wgsl(a);               //   by IH on a
+            lemma_eval_matches_wgsl(b);               //   by IH on b
         },
-        GpuExpr::Select(c, t, f) => { /* IH on c, t, f */ },
-        GpuExpr::ArrayRead(buf, idx) => { /* IH on idx */ },
-        GpuExpr::Call(fn_id, args) => { /* IH on each arg */ },
+        GpuExpr::VecConstruct(components) => {        // component-wise IH
+            /* IH on each component */
+        },
+        // ... one case per variant, each trivial by IH ...
     }
 }
 ```
@@ -351,35 +323,50 @@ proof fn lemma_emit_expr_preserves_eval(e: &GpuExpr)
 Similarly for statements:
 
 ```rust
-proof fn lemma_emit_stmt_preserves_eval(s: &GpuStmt)
+proof fn lemma_eval_stmt_matches_wgsl(s: &GpuStmt)
     requires gpu_stmt_wf(s, n_locals, n_bufs)
     ensures forall |state: GpuState| gpu_stmt_safe(s, state) ==>
-        wgsl_interp_stmt(emit_stmt(s), state) == gpu_eval_stmt(s, state)
+        wgsl_semantics_stmt(s, state) == gpu_eval_stmt(s, state, &seq![])
     decreases s
 ```
 
-### 5.3 What is `wgsl_interp`?
+### 5.3 What is `wgsl_semantics`?
 
-This is the one subtlety. We need to say "the WGSL text computes X" without
-formalizing all of WGSL. Our approach: define `wgsl_interp` as a Verus spec
-function that captures the semantics of ONLY the WGSL constructs we emit.
+The emit proof needs a "WGSL-side" interpretation to compare against
+`gpu_eval`. Key insight: since emit is a structural map, we define
+`wgsl_semantics` **directly on GpuIR nodes**, not on strings. It captures
+"what WGSL would compute for this construct":
 
-This is NOT a general WGSL interpreter. It's a ~100-line spec function
-mirroring our ~80-line emitter, defining the obvious semantics:
-- `"(a + b)"` means `interp(a) + interp(b)`
-- `"if (c) { ... } else { ... }"` means branch on `interp(c)`
-- `"for (var i = 0; i < n; i++) { ... }"` means bounded iteration
-- etc.
+```rust
+/// WGSL semantics for a GpuExpr — defined on the IR, not on strings.
+/// Captures what a conformant WGSL implementation computes.
+spec fn wgsl_semantics_expr(e: &GpuExpr, state: &GpuState) -> GpuValue
+```
 
-The claim "this spec matches real WGSL behavior" is our minimal axiom — it's
-the analog of CompCert trusting the C semantics or CakeML trusting the
-ISA spec. For integer arithmetic with bounded loops, this is about as
-uncontroversial as axioms get.
+Then the general proof is:
+
+```
+gpu_eval_expr(e, state) == wgsl_semantics_expr(e, state)   // for all e
+```
+
+Both are spec functions on GpuIR. The proof is structural induction showing
+they agree on every variant. The trusted claim is: "`wgsl_semantics_expr`
+faithfully models what a WGSL implementation does." For integer addition,
+this is `a + b = a + b`. For bounded for-loops, this is iteration. For
+float ops, this is IEEE 754 arithmetic. Uncontroversial.
+
+The **string rendering** (`emit: GpuIR → WGSL text`) is a separate trusted
+layer (~80 lines). It's correct iff it renders each GpuIR node as the WGSL
+syntax that `wgsl_semantics` describes. This is auditable by inspection.
+
+This avoids the awkwardness of parsing strings in Verus spec functions.
+The analog: CompCert trusts its C semantics spec, CakeML trusts its ISA
+spec. We trust `wgsl_semantics` — a ~100-line spec on well-typed IR nodes.
 
 ### 5.4 What gets proved (general, once)
 
-1. **Emit preserves expression eval** — `wgsl_interp(emit(e)) == gpu_eval_expr(e)` for all `e`
-2. **Emit preserves statement eval** — `wgsl_interp_stmt(emit(s)) == gpu_eval_stmt(s)` for all `s`
+1. **Eval matches WGSL semantics (exprs)** — `wgsl_semantics_expr(e) == gpu_eval_expr(e)` for all `e`
+2. **Eval matches WGSL semantics (stmts)** — `wgsl_semantics_stmt(s) == gpu_eval_stmt(s)` for all `s`
 3. **GpuIR eval is total and deterministic**
 4. **Overflow safety propagates** — well-formed + fits-i64 is maintained through eval
 5. **Array bounds safety** — well-formed implies all accesses in bounds
@@ -469,16 +456,15 @@ fn reduce_kernel(
     smem[tid] = input[tid];
     gpu_workgroup_barrier();     // all threads have written to smem
 
-    // tree reduction
-    let mut stride: u32 = 128;
-    while stride > 0
-        invariant /* partial reduction correct for current stride */
+    // tree reduction: 8 rounds (log2(256) = 8), stride = 128, 64, ..., 1
+    for round in 0..8u32
+        invariant /* partial reduction correct after `round` rounds */
     {
+        let stride: u32 = 128 >> round;
         if tid < stride {
             smem[tid] = smem[tid] + smem[tid + stride];
         }
         gpu_workgroup_barrier(); // all threads see updated smem
-        stride = stride / 2;
     }
 
     if tid == 0 {
@@ -541,20 +527,468 @@ spec fn gpu_writes_injective(k: &GpuKernel, bufs: Seq<Seq<int>>,
 }
 ```
 
-**Open question**: Extracting write indices from a statement tree (with control
-flow) is more complex than from ArithExpr scatter expressions. Should we require
-users to express the scatter pattern explicitly via an attribute, or can we infer
-it from the GpuStmt structure?
+Per D7: the user proves race freedom explicitly via companion proof functions.
 
 ---
 
-## 8. Resolved Decisions
+## 8. Hardware Faithfulness Audit
+
+Comprehensive check of WGSL compute shader features against our GpuIR model.
+Goal: don't abstract away anything the user might need for correct, performant
+kernels.
+
+### 8.1 What we model (covered in GpuIR)
+
+| Hardware feature | GpuIR representation | Faithful? |
+|---|---|---|
+| Integer arithmetic (i32, u32) | GpuExpr::BinOp + GpuType | Yes |
+| Float arithmetic (f32) | GpuExpr::BinOp(FAdd, ..) + GpuType::F32 | Yes |
+| Storage buffers (read, read_write) | `#[gpu_buffer]` annotation + BufWrite/ArrayRead | Yes |
+| Workgroup shared memory | `#[gpu_shared]` annotation + GpuState.bufs | Yes |
+| Barriers (workgroup, storage, subgroup) | GpuStmt::Barrier { scope } | Yes |
+| Bounded loops | GpuStmt::For | Yes |
+| Conditionals | GpuStmt::If | Yes |
+| Function calls | GpuExpr::Call | Yes |
+| Thread builtins (global_id, local_id, etc.) | `#[gpu_builtin]` params | Yes |
+| Type casts | GpuExpr::Cast | Yes |
+| No recursion | Enforced by parser | Yes |
+| No unbounded loops | For-only, no while | Yes |
+
+### 8.2 What's MISSING — adding now
+
+**Atomic operations** (CORRECTNESS — essential for cross-workgroup algorithms):
+
+```rust
+pub enum AtomicOp {
+    Load, Store, Add, Sub, Max, Min,
+    And, Or, Xor, Exchange, CompareExchangeWeak,
+}
+
+// New GpuStmt variant:
+AtomicRMW { buf: nat, idx: GpuExpr, op: AtomicOp, val: GpuExpr, result_var: nat },
+```
+
+WGSL atomics use **relaxed ordering only** — no acquire/release/seq_cst.
+This is a hardware limitation we model faithfully. Cross-workgroup sync
+requires atomics + careful algorithm design (e.g., decoupled lookback).
+User must prove: atomic operations are well-typed (only on `atomic<i32>`
+or `atomic<u32>` in storage/workgroup space).
+
+**Subgroup (warp) operations** (PERFORMANCE — essential for efficient reductions):
+
+```rust
+pub enum SubgroupOp {
+    Add, Mul, Min, Max, And, Or, Xor,       // reductions
+    ExclusiveAdd, InclusiveAdd,              // scans
+    Broadcast, BroadcastFirst,               // communication
+    Shuffle, ShuffleXor, ShuffleUp, ShuffleDown,
+    Ballot, All, Any, Elect,                 // voting
+}
+
+// New GpuExpr variant:
+SubgroupOp(SubgroupOp, Box<GpuExpr>),
+```
+
+Requires `enable subgroups;` in WGSL. Must be called in **subgroup-uniform
+control flow** — user proves this as an additional obligation.
+
+**Uniform buffers** (CORRECTNESS — different semantics from storage):
+
+```rust
+#[gpu_uniform(binding = N)]   // maps to var<uniform>
+```
+
+Read-only, all threads see same data. Hardware broadcasts efficiently.
+Important for kernel parameters (dimensions, strides, constants).
+
+**Wrapping arithmetic** (CORRECTNESS — faithful to hardware):
+
+```rust
+pub enum GpuBinOp {
+    // ... existing ops (default: proven overflow-free) ...
+    // Wrapping variants: no overflow proof needed, wraps at 32 bits
+    WrappingAdd, WrappingSub, WrappingMul,
+}
+```
+
+WGSL i32/u32 arithmetic wraps silently. By default we require the user to
+prove no overflow (catches bugs). But for algorithms that intentionally use
+wrapping (hash functions, checksums), we provide explicit wrapping ops.
+
+**Uniform control flow obligation** (CORRECTNESS — UB if violated):
+
+Barriers and subgroup operations require **uniform control flow**: all threads
+in the scope must reach the call. Violating this is UB in WGSL. We model this
+as a proof obligation the user must satisfy:
+
+```rust
+proof fn barrier_uniform_control_flow(tid1: nat, tid2: nat)
+    requires
+        tid1 < workgroup_size, tid2 < workgroup_size,
+    ensures
+        // both threads reach the barrier (same branch taken)
+        reaches_barrier(kernel_body, tid1, barrier_id)
+        == reaches_barrier(kernel_body, tid2, barrier_id)
+```
+
+**All builtins** (CORRECTNESS — complete set):
+
+```rust
+pub enum GpuBuiltin {
+    GlobalInvocationId { dim: nat },    // gid.x/y/z
+    LocalInvocationId { dim: nat },     // lid.x/y/z
+    LocalInvocationIndex,               // linearized local id
+    WorkgroupId { dim: nat },           // wgid.x/y/z
+    NumWorkgroups { dim: nat },         // dispatch dimensions
+    SubgroupId,                         // which subgroup within workgroup
+    SubgroupInvocationId,               // thread index within subgroup
+    SubgroupSize,                       // subgroup width (typically 32 or 64)
+}
+```
+
+### 8.3 Additional features (included, not deferred)
+
+All features below are included in GpuIR to avoid leaving performance or
+correctness gaps. The principle: if real GPU kernels need it, we model it.
+
+**f16 (half precision)**:
+
+Requires `enable f16;` in WGSL. Critical for ML workloads (transformer
+inference, mixed-precision training). GpuType gains `F16` variant.
+Arithmetic ops apply to f16 the same as f32. Verus f16 support TBD —
+may need external_body wrappers until Verus adds native f16.
+
+**vec2/vec3/vec4 types** (hardware SIMD):
+
+WGSL has `vec2<T>`, `vec3<T>`, `vec4<T>` for T in {f32, f16, i32, u32}.
+These map to hardware SIMD lanes. A vec4 load is up to 4x faster than
+four scalar loads. GpuIR support:
+
+```rust
+pub enum GpuType {
+    I32, U32, F32, F16, Bool,
+    Vec2(Box<GpuType>),   // vec2<f32>, vec2<i32>, etc.
+    Vec3(Box<GpuType>),
+    Vec4(Box<GpuType>),
+    Mat(nat, nat),        // mat2x2 through mat4x4 (always f32 or f16)
+}
+
+// New GpuExpr variants for vectors:
+VecConstruct(Seq<GpuExpr>),              // vec3(x, y, z)
+VecComponent(Box<GpuExpr>, nat),         // v.x (0), v.y (1), v.z (2), v.w (3)
+Swizzle(Box<GpuExpr>, Seq<nat>),         // v.xyz, v.xz, v.ww, etc.
+```
+
+Component-wise arithmetic works automatically: `vec3 + vec3` applies `+`
+per component. The emit proof extends by structural induction — vec cases
+are component-wise applications of the scalar case.
+
+**Matrix types**:
+
+`mat2x2<f32>` through `mat4x4<f32>` (and f16). Matrix-vector multiply
+(`mat * vec`) and matrix-matrix multiply (`mat * mat`) are single WGSL
+expressions. GpuIR support:
+
+```rust
+// New GpuExpr variants for matrices:
+MatConstruct(nat, nat, Seq<GpuExpr>),    // mat3x3(col0, col1, col2)
+MatMul(Box<GpuExpr>, Box<GpuExpr>),      // mat * mat or mat * vec
+Transpose(Box<GpuExpr>),                  // transpose(m)
+Determinant(Box<GpuExpr>),               // determinant(m) (2x2, 3x3, 4x4)
+```
+
+**Texture load/store**:
+
+`textureLoad(tex, coords)` and `textureStore(tex, coords, value)` on storage
+textures. Used in image processing compute kernels. GpuIR support:
+
+```rust
+pub enum TextureOp { Load, Store }
+
+// New GpuExpr variant:
+TextureOp { tex: nat, coords: Box<GpuExpr>, value: Option<Box<GpuExpr>> },
+```
+
+User must prove: coords in bounds for texture dimensions.
+
+**Indirect dispatch**:
+
+Dispatch dimensions read from a buffer instead of host-specified constants.
+Not a GpuIR change — it's a runtime/dispatch-level feature. The kernel code
+is identical; only the dispatch call changes. Modeled as a variant in the
+dispatch metadata, not in GpuIR itself.
+
+**Packed types**:
+
+`pack4x8snorm(vec4<f32>) -> u32` and `unpack4x8snorm(u32) -> vec4<f32>`.
+Compact encoding for normalized values. GpuIR support:
+
+```rust
+pub enum PackFormat { SNorm, UNorm, SInt, UInt }
+
+// New GpuExpr variants:
+Pack4x8(PackFormat, Box<GpuExpr>),       // vec4<f32> → u32
+Unpack4x8(PackFormat, Box<GpuExpr>),     // u32 → vec4<f32>
+```
+
+**Memory coalescing proofs** (performance verification):
+
+Global memory loads are coalesced when adjacent threads access adjacent
+addresses. Uncoalesced access can be 10-32x slower. We model this as a
+provable property:
+
+```rust
+/// Adjacent threads access adjacent memory (coalesced load).
+spec fn is_coalesced_access(
+    buf: nat, idx_expr: &GpuExpr, workgroup_size: nat
+) -> bool {
+    forall |tid: nat| tid + 1 < workgroup_size ==>
+        gpu_eval_expr(idx_expr, env_for(tid+1), bufs)
+        == gpu_eval_expr(idx_expr, env_for(tid), bufs) + 1
+}
+```
+
+Not required for correctness, but the user CAN prove it as an optimization
+guarantee. We provide library lemmas for common patterns (linear access,
+strided access with known stride).
+
+**Bank conflict proofs** (performance verification):
+
+Shared memory has 32 banks (4-byte stride). Two threads in a warp accessing
+the same bank (different address) causes serialization. We model this:
+
+```rust
+/// No bank conflicts within a warp for shared memory access.
+spec fn bank_conflict_free(
+    smem_idx_expr: &GpuExpr, warp_size: nat
+) -> bool {
+    forall |t1: nat, t2: nat|
+        t1 < warp_size && t2 < warp_size && t1 != t2 ==>
+        // different bank OR same address (broadcast)
+        bank(gpu_eval_expr(smem_idx_expr, env_for(t1), bufs))
+        != bank(gpu_eval_expr(smem_idx_expr, env_for(t2), bufs))
+        || gpu_eval_expr(smem_idx_expr, env_for(t1), bufs)
+        == gpu_eval_expr(smem_idx_expr, env_for(t2), bufs)
+}
+
+spec fn bank(addr: int) -> nat { (addr / 4) % 32 }
+```
+
+Again, optional for correctness but provable for performance. The existing
+swizzle infrastructure in verus-cutedsl was designed exactly for this —
+`swizzled_offset` eliminates bank conflicts by permuting addresses.
+
+### 8.4 Updated GpuIR types (complete)
+
+```rust
+// ── Scalar and composite types ──────────────────────────────
+
+pub enum ScalarType { I32, U32, F32, F16, Bool }
+
+pub enum GpuType {
+    Scalar(ScalarType),
+    Vec2(ScalarType),
+    Vec3(ScalarType),
+    Vec4(ScalarType),
+    Mat { cols: nat, rows: nat, elem: ScalarType },  // mat2x2..mat4x4
+    Void,                                             // for kernel/helper return
+}
+
+// ── Operators ───────────────────────────────────────────────
+
+pub enum GpuBinOp {
+    // Integer arithmetic (proven overflow-free)
+    Add, Sub, Mul, Div, Mod, Shr, Shl,
+    // Wrapping integer arithmetic (no overflow proof, wraps at 32 bits)
+    WrappingAdd, WrappingSub, WrappingMul,
+    // Float arithmetic (f32 and f16)
+    FAdd, FSub, FMul, FDiv,
+    // Comparisons (return Bool)
+    Lt, Le, Gt, Ge, Eq, Ne,
+    // Bitwise (integer only)
+    BitAnd, BitOr, BitXor,
+    // Logical (bool only)
+    LogicalAnd, LogicalOr,
+}
+
+pub enum GpuUnaryOp { Neg, FNeg, Not, LogicalNot }
+
+pub enum AtomicOp {
+    Load, Store, Add, Sub, Max, Min,
+    And, Or, Xor, Exchange, CompareExchangeWeak,
+}
+
+pub enum SubgroupOp {
+    // Reductions
+    Add, Mul, Min, Max, And, Or, Xor,
+    // Scans
+    ExclusiveAdd, InclusiveAdd, ExclusiveMul, InclusiveMul,
+    // Communication
+    Broadcast(nat),  // lane index
+    BroadcastFirst,
+    Shuffle, ShuffleXor, ShuffleUp, ShuffleDown,
+    // Voting
+    Ballot, All, Any, Elect,
+}
+
+pub enum BarrierScope { Workgroup, Storage, Subgroup }
+
+pub enum PackFormat { SNorm, UNorm, SInt, UInt }
+
+// ── Builtins ────────────────────────────────────────────────
+
+pub enum GpuBuiltin {
+    GlobalInvocationId { dim: nat },    // vec3<u32>
+    LocalInvocationId { dim: nat },     // vec3<u32>
+    LocalInvocationIndex,               // u32 (linearized)
+    WorkgroupId { dim: nat },           // vec3<u32>
+    NumWorkgroups { dim: nat },         // vec3<u32>
+    SubgroupId,                         // u32
+    SubgroupInvocationId,               // u32
+    SubgroupSize,                       // u32
+}
+
+// ── Expressions ─────────────────────────────────────────────
+
+pub enum GpuExpr {
+    // Constants
+    Const(int, ScalarType),             // integer/bool constant with type
+    FConst(f32),                        // f32 constant
+    HConst(f32),                        // f16 constant (stored as f32, emitted as f16)
+
+    // Variables and builtins
+    Var(nat, GpuType),                  // local variable with type
+    Builtin(GpuBuiltin),               // thread/workgroup builtins
+
+    // Arithmetic and logic
+    BinOp(GpuBinOp, Box<GpuExpr>, Box<GpuExpr>),
+    UnaryOp(GpuUnaryOp, Box<GpuExpr>),
+    Select(Box<GpuExpr>, Box<GpuExpr>, Box<GpuExpr>),  // cond ? a : b
+
+    // Memory access
+    ArrayRead(nat, Box<GpuExpr>),       // buf[idx]
+    TextureLoad(nat, Box<GpuExpr>),     // textureLoad(tex, coords)
+
+    // Function call
+    Call(nat, Seq<GpuExpr>),            // fn_table[id](args...)
+
+    // Type conversion
+    Cast(GpuType, Box<GpuExpr>),        // e.g., i32 → f32, f32 → f16
+
+    // Vector operations
+    VecConstruct(Seq<GpuExpr>),         // vec3(x, y, z)
+    VecComponent(Box<GpuExpr>, nat),    // v.x (0), v.y (1), v.z (2), v.w (3)
+    Swizzle(Box<GpuExpr>, Seq<nat>),    // v.xyz, v.xz, v.ww
+
+    // Matrix operations
+    MatConstruct(nat, nat, Seq<GpuExpr>),  // mat3x3(col0, col1, col2)
+    MatMul(Box<GpuExpr>, Box<GpuExpr>),    // mat*mat or mat*vec
+    Transpose(Box<GpuExpr>),
+    Determinant(Box<GpuExpr>),
+
+    // Packed types
+    Pack4x8(PackFormat, Box<GpuExpr>),     // vec4<f32> → u32
+    Unpack4x8(PackFormat, Box<GpuExpr>),   // u32 → vec4<f32>
+
+    // Subgroup operations
+    SubgroupOp(SubgroupOp, Box<GpuExpr>),
+}
+
+// ── Statements ──────────────────────────────────────────────
+
+pub enum GpuStmt {
+    Assign { var: nat, rhs: GpuExpr },
+    BufWrite { buf: nat, idx: GpuExpr, val: GpuExpr },
+    TextureStore { tex: nat, coords: GpuExpr, val: GpuExpr },
+    AtomicRMW { buf: nat, idx: GpuExpr, op: AtomicOp,
+                val: GpuExpr, result_var: Option<nat> },  // None = fire-and-forget
+    Block(Seq<GpuStmt>),                                   // flat statement list
+    If { cond: GpuExpr, then_body: Box<GpuStmt>, else_body: Box<GpuStmt> },
+    For { var: nat, start: GpuExpr, end: GpuExpr,          // for var in start..end
+          body: Box<GpuStmt> },
+    Break,
+    Continue,
+    Barrier { scope: BarrierScope },
+    Return,
+    Noop,
+}
+
+// ── Program structure ───────────────────────────────────────
+
+pub struct GpuFunction {
+    pub params: Seq<(nat, GpuType)>,
+    pub ret_type: GpuType,
+    pub body: GpuStmt,
+    pub ret_var: nat,
+}
+
+pub enum MemorySpace { Storage, Workgroup, Uniform }
+
+pub struct BufferBinding {
+    pub binding: nat,
+    pub space: MemorySpace,
+    pub read_only: bool,
+    pub elem_type: GpuType,
+}
+
+pub struct TextureBinding {
+    pub binding: nat,
+    pub read_only: bool,
+    pub texel_type: GpuType,
+    pub dimensions: nat,           // 1D, 2D, 3D
+}
+
+pub struct GpuKernel {
+    pub n_locals: nat,
+    pub buffers: Seq<BufferBinding>,
+    pub textures: Seq<TextureBinding>,
+    pub functions: Seq<GpuFunction>,
+    pub body: GpuStmt,
+    pub workgroup_size: (nat, nat, nat),
+    pub enable_subgroups: bool,
+    pub enable_f16: bool,
+}
+```
+
+### 8.5 User proof obligations (complete list)
+
+The user must prove, per kernel:
+
+**Correctness (required):**
+
+1. **Buffer bounds** — all reads/writes within buffer length
+2. **Texture bounds** — all texture load/store coords within dimensions
+3. **Overflow safety** — non-wrapping arithmetic doesn't overflow i32/u32
+4. **Race freedom** — no two threads write to same non-atomic location
+   within a barrier interval
+5. **Barrier uniformity** — all threads in scope reach each barrier
+6. **Subgroup uniformity** — all active threads in subgroup reach each
+   subgroup operation
+7. **Atomic type safety** — atomics only on i32/u32 in storage/workgroup
+8. **Type safety** — operations applied to correct types (vec/mat
+   dimensions match, cast targets are valid)
+9. **Functional correctness** — the ensures clause (application-specific)
+
+**Performance (optional but provable):**
+
+10. **Memory coalescing** — adjacent threads access adjacent global memory
+11. **Bank conflict freedom** — no shared memory bank conflicts within a warp
+12. **Occupancy bounds** — shared memory + register usage within SM limits
+
+We provide library lemmas for common patterns (identity scatter, strided
+scatter, tree reduction, coalesced linear access, bank-conflict-free
+swizzled access, etc.) so users don't re-prove boilerplate.
+
+---
+
+## 9. Resolved Decisions
 
 ### D1: WgslIR — DROPPED
 
-One IR (GpuIR). No WgslIR. The emit function goes directly from GpuIR to
-WGSL strings. The general correctness proof uses `wgsl_interp` (a ~100-line
-spec defining the obvious semantics of our WGSL subset) — no separate IR type.
+One IR (GpuIR). No WgslIR. `wgsl_semantics` is defined directly on GpuIR
+nodes (not on strings). The emit function renders GpuIR to WGSL strings
+(trusted ~150 lines). The correctness proof shows `gpu_eval == wgsl_semantics`
+by structural induction.
 
 ### D2: SPIR-V — EMIT WGSL INSTEAD
 
@@ -572,15 +1006,15 @@ normal job (verify source function satisfies requires/ensures).
 ### D4: Scope of "verified"
 
 **Theorem**: *For all well-formed GpuKernel `k` and valid GpuState `s`,
-`wgsl_interp(emit(k), s) == gpu_eval_kernel(k, s)`.*
+`wgsl_semantics_kernel(k, s) == gpu_eval_kernel(k, s)`.*
 
 Proved once by structural induction. Combined with Verus verification of the
 source function, this gives end-to-end: source spec holds → WGSL output
 satisfies the same spec.
 
 **Trusted base** (irreducible):
-- `wgsl_interp` spec matches real WGSL behavior (uncontroversial for integer
-  arithmetic + bounded loops)
+- `wgsl_semantics` spec matches real WGSL behavior (uncontroversial for
+  integer/float arithmetic + bounded loops + vectors + atomics)
 - Parser: source → GpuIR (~300 lines, bugs caught by testing)
 - naga/tint: WGSL → SPIR-V
 - GPU driver + silicon
@@ -596,8 +1030,8 @@ satisfies the same spec.
 | Exec | Passthrough (assign, return) | Works |
 | Exec arithmetic | `a + b` requires `add_req` precondition; result is nondeterministic (IEEE rounding modes) | Works with precondition |
 
-**Design**: GpuIR supports both integer and float types natively. The GpuExpr
-type uses `GpuType { I32, U32, F32 }` tags. At the spec level, float
+**Design**: GpuIR supports both integer and float types natively (see
+Section 8.4 for the full `ScalarType`/`GpuType` hierarchy). At the spec level, float
 arithmetic is fully available for writing specs (dot products, GEMM
 accumulation, etc.). At the exec level, float arithmetic goes through Verus's
 `add_req`/`mul_req` preconditions — the user must prove the operation is
@@ -679,8 +1113,6 @@ Both use the same tree-sitter front-end + GpuIR construction internally.
 
 ---
 
-## 9. Open Questions
-
 ### D9: Type tags — CARRY ON EVERY NODE
 
 GpuExpr carries `GpuType` on every node. Simplifies the emit proof (each
@@ -709,27 +1141,285 @@ is trivially guaranteed by the bound).
 
 | Phase | Deliverable | Depends on |
 |-------|-------------|------------|
-| **1** | GpuExpr + GpuStmt + eval semantics + well-formedness | — |
-| **2** | `wgsl_interp` spec + `emit` function + general correctness proof | Phase 1 |
-| **3** | WGSL string rendering + naga validation tests | Phase 2 |
-| **4** | ArithExpr → GpuExpr embedding + equivalence proof | Phase 1 |
-| **5** | tree-sitter front-end parser | Phase 1 |
-| **6** | End-to-end demo: vector_add as `#[gpu_kernel]` → WGSL | Phase 3, 5 |
-| **7** | Stage integration (race freedom for GpuIR) | Phase 1 |
-| **8** | Port tiled GEMM, scan, radix sort | Phase 6, 7 |
+| **1a** | GpuValue + scalar GpuExpr/GpuStmt + eval semantics | — |
+| **1b** | Vec/mat/texture/atomic/subgroup GpuExpr extensions | 1a |
+| **1c** | Well-formedness + safety predicates | 1a |
+| **2** | `wgsl_semantics` spec + general correctness proof | 1a |
+| **3** | WGSL string rendering + naga validation tests | 2 |
+| **4** | ArithExpr → GpuExpr embedding + equivalence proof | 1a |
+| **5** | tree-sitter front-end parser | 1b |
+| **6** | End-to-end demo: vector_add as `#[gpu_kernel]` → WGSL | 3, 5 |
+| **7** | Stage integration (race freedom, barrier uniformity) | 1a |
+| **8** | Performance proof library (coalescing, bank conflicts) | 1a |
+| **9** | Port tiled GEMM, scan, radix sort | 6, 7 |
 
 **Milestone 1** (Phases 1-3): GpuIR with formal semantics, emit to WGSL,
 general correctness proof. Validates core architecture — the hardest part.
+Start with scalar types, extend to vec/mat/subgroup.
 
 **Milestone 2** (Phases 4-6): Full developer experience. Write `#[gpu_kernel]`
 Verus function, parse, emit, run on GPU. ArithExpr backward compat.
 
-**Milestone 3** (Phases 7-8): Tiled GEMM in natural Verus, verified and
-transpiled. The motivating use case.
+**Milestone 3** (Phases 7-9): Tiled GEMM in natural Verus, verified and
+transpiled, with race freedom + coalescing proofs. The motivating use case.
+
+**Milestone 4** (Phase 10): CUDA backend with tensor core support.
 
 ---
 
-## 11. References
+## 11. Dual Target: WGSL + CUDA
+
+### 11.1 Why both
+
+WGSL: portable (WebGPU, all vendors), naga/tint optimize for us, good for
+deployment. But WGSL can't express tensor cores, async copy, warp
+specialization — ceiling on performance for NVIDIA hardware.
+
+CUDA: state-of-the-art performance on NVIDIA (tensor cores, cp.async, thread
+block clusters). But NVIDIA-only, requires nvcc/ptxas toolchain.
+
+The GpuIR is already backend-neutral — it represents GPU *concepts*, not
+WGSL-specific syntax. Adding CUDA is a second emitter + second semantics spec.
+
+### 11.2 Architecture
+
+```
+                          ┌──> [emit_wgsl] ──> WGSL ──> [naga] ──> SPIR-V
+                          │     trusted         portable
+GpuIR (one IR) ──────────┤
+  verified eval semantics │
+  + safety proofs         └──> [emit_cuda] ──> CUDA ──> [nvcc] ──> PTX
+                                trusted         NVIDIA, tensor cores
+```
+
+Both emitters are trusted (structural maps, ~150 lines each). Both have a
+corresponding `*_semantics` spec. Both are proved correct once:
+
+```
+gpu_eval(ir) == wgsl_semantics(ir)     // for WGSL backend
+gpu_eval(ir) == cuda_semantics(ir)     // for CUDA backend
+```
+
+Since both equal `gpu_eval`, they're also equal to each other — the two
+backends produce semantically identical results for shared GpuIR programs.
+
+### 11.3 CUDA-specific GpuIR extensions
+
+For features that CUDA has but WGSL doesn't, we add GpuIR variants that
+the CUDA backend emits and the WGSL backend rejects:
+
+```rust
+pub enum GpuExpr {
+    // ... all existing variants (work on both backends) ...
+
+    // CUDA-only: tensor core matrix multiply-accumulate
+    TensorCoreMMA {
+        m: nat, n: nat, k: nat,              // tile dimensions (e.g., 16x16x16)
+        a_frag: Box<GpuExpr>,                // A fragment
+        b_frag: Box<GpuExpr>,                // B fragment
+        c_frag: Box<GpuExpr>,                // accumulator
+    },
+
+    // CUDA-only: async global→shared memory copy
+    AsyncCopy {
+        dst_smem: nat,                        // shared memory buffer
+        src_gmem: nat,                        // global memory buffer
+        idx: Box<GpuExpr>,
+        size: nat,                            // bytes per thread
+    },
+}
+
+pub enum GpuStmt {
+    // ... all existing variants ...
+
+    // CUDA-only: async copy fence/wait
+    AsyncCopyCommit,                          // cp.async.commit_group
+    AsyncCopyWait { groups: nat },            // cp.async.wait_group
+
+    // CUDA-only: warp-level matrix store
+    TensorCoreStore {
+        buf: nat,
+        idx: GpuExpr,
+        frag: GpuExpr,
+    },
+}
+
+pub struct GpuKernel {
+    // ... existing fields ...
+    pub target: GpuTarget,                    // which backend(s) this kernel supports
+}
+
+pub enum GpuTarget {
+    Both,         // portable: WGSL + CUDA
+    WgslOnly,     // WGSL-specific features
+    CudaOnly,     // tensor cores, async copy, etc.
+}
+```
+
+### 11.4 CUDA emit mapping
+
+| GpuIR | CUDA output |
+|-------|-------------|
+| `Barrier { Workgroup }` | `__syncthreads()` |
+| `Barrier { Subgroup }` | `__syncwarp()` |
+| `SubgroupOp(ShuffleXor, e)` | `__shfl_xor_sync(0xffffffff, e, lane)` |
+| `SubgroupOp(Add, e)` | warp reduction via `__shfl_down_sync` tree |
+| `AtomicRMW { Add, .. }` | `atomicAdd(&buf[idx], val)` |
+| `TensorCoreMMA { 16,16,16, .. }` | `wmma::mma_sync(d, a, b, c)` |
+| `AsyncCopy { .. }` | `cp.async.cg.shared.global` |
+| `For { var, start, end, body }` | `for (int var = start; var < end; var++)` |
+| `VecConstruct([x,y,z,w])` | `make_float4(x, y, z, w)` |
+
+### 11.5 What this means for the proof
+
+The general correctness proof becomes two proofs (both structural induction):
+1. `gpu_eval == wgsl_semantics` (covers portable GpuIR)
+2. `gpu_eval == cuda_semantics` (covers portable + CUDA-specific GpuIR)
+
+For CUDA-specific variants (tensor cores, async copy), we define their
+`gpu_eval` semantics (what the MMA mathematically computes) and their
+`cuda_semantics` (what the CUDA intrinsic computes). The proof connects them.
+
+Tensor core semantics are interesting: `TensorCoreMMA(16,16,16, A, B, C)`
+computes `C += A * B` where A is 16x16, B is 16x16. This connects directly
+to the existing GEMM correctness specs in `verus-cutedsl/src/gemm.rs`.
+
+### 11.6 Implementation: CUDA backend as Phase 10
+
+| Phase | Deliverable | Depends on |
+|-------|-------------|------------|
+| **10a** | `cuda_semantics` spec for portable GpuIR | Phase 2 |
+| **10b** | CUDA string emitter + nvcc validation tests | 10a |
+| **10c** | CUDA correctness proof (structural induction) | 10a |
+| **10d** | TensorCoreMMA + AsyncCopy GpuIR extensions | 10a |
+| **10e** | Tensor core GEMM in Verus → CUDA | 10d, Phase 9 |
+
+The WGSL backend ships first (Milestone 1-3). CUDA backend follows as
+Milestone 4. Both share the same GpuIR, same parser, same proof obligations.
+
+---
+
+## 12. Risks and Limitations
+
+Honest assessment of where this project could be misguided.
+
+### R1: The verification gap is in the wrong place
+
+DarthShader (CCS 2024) found 39 bugs in naga/tint — the shader *compilers*,
+not kernel source code. We verify source→IR→WGSL/CUDA but trust naga/tint/nvcc,
+which is where the real bugs live. If the goal is "fewer GPU bugs in practice,"
+verifying naga would have more impact.
+
+**Mitigation**: Our verification catches a different class of bugs —
+algorithmic errors (wrong index, race condition, overflow) rather than
+compiler bugs (miscompilation). Both matter. And our verified CuTe layout
+algebra prevents the specific class of index computation bugs that are
+notorious in GPU code.
+
+### R2: The parser is a 700-line trusted gap
+
+The trust chain is: Verus Rust → (parser, ~700 lines trusted) → GpuIR →
+(verified) → WGSL/CUDA. A parser bug silently produces wrong GpuIR. The
+general emit proof doesn't help — it proves the wrong GpuIR is emitted
+correctly.
+
+**Mitigation**: (a) Parser bugs are caught by differential testing (run WGSL
+on GPU, compare against Verus exec on CPU). (b) GpuIR is inspectable — a
+human can read it. (c) The parser is structural (one CST node → one GpuIR
+node), limiting the space for subtle bugs. (d) Long-term: could verify the
+parser against a formal Rust subset semantics, but this is a large effort.
+
+### R3: `wgsl_semantics` / `cuda_semantics` could be wrong
+
+Both `gpu_eval` and `wgsl_semantics` are defined by us. If `wgsl_semantics`
+is wrong, the proof is vacuously true. GPU memory models (relaxed atomics,
+memory visibility, subgroup semantics) are subtle and differ across vendors.
+
+**Mitigation**: (a) For integer/float arithmetic, the semantics are obvious
+(addition is addition). (b) For atomics and barriers, we follow the WGSL/CUDA
+spec text carefully. (c) The semantics spec is small (~100 lines per backend)
+and auditable. (d) Testing: if `wgsl_semantics` disagrees with what GPUs
+actually do, differential testing catches it.
+
+### R4: Float verification is mostly trusted
+
+Verus exec-level f32 arithmetic is nondeterministic (`add_req` but no
+`ensures result == a + b`). For float-heavy kernels, the "verified" part
+only covers indices, bounds, and races — not the actual computation.
+
+**Mitigation**: This is correct and by design. IEEE 754 float arithmetic
+has implementation-defined rounding, fused multiply-add, denormal handling.
+Verifying exact float results would require a formal IEEE 754 model (large
+effort, exists in Coq but not Verus). Our approach: verify everything except
+float precision, which is faithful to what the hardware actually guarantees.
+
+### R5: Proof effort may be disproportionate
+
+For a simple vector_add: 5 lines of kernel, ~20 lines of proofs. For tiled
+GEMM: ~50 lines of kernel, potentially hundreds of lines of proofs.
+Meanwhile, differential testing (GPU vs CPU reference) catches most bugs
+with zero proof effort.
+
+**Mitigation**: (a) The proof effort amortizes — library lemmas for common
+patterns (identity scatter, strided scatter, tree reduction) are proved once
+and reused. (b) Formal verification catches bugs that testing misses: rare
+thread interleavings, edge cases in integer overflow, subtle index errors
+that only manifest at specific tensor dimensions. (c) For safety-critical
+GPU code (autonomous driving, medical imaging), the proof effort is
+justified.
+
+### R6: The sequential eval model doesn't capture parallel bugs
+
+`gpu_eval_stmt` evaluates one thread sequentially. Real GPU bugs involve
+thread interactions: races, deadlocks, barrier divergence. The Stage model
+addresses some of this, but complex patterns (producer-consumer, warp
+specialization, decoupled lookback) may not fit.
+
+**Mitigation**: (a) The Stage framework is extensible — new patterns can be
+added as new Stage variants with new proof obligations. (b) The barrier
+uniformity proof obligation catches divergence bugs. (c) The race freedom
+proof obligation catches data races. Together these cover the most common
+parallel bugs. (d) More exotic patterns (warp specialization) can be
+modeled as they arise.
+
+### R7: Scope is large
+
+The original problem was "add functions to ArithExpr." The solution grew to
+a complete verified GPU transpiler with ~25 GpuExpr variants, dual WGSL/CUDA
+backends, performance proofs, and a full hardware audit. This is a
+multi-month project.
+
+**Mitigation**: (a) The phased plan delivers value incrementally — Milestone 1
+(scalar GpuIR + WGSL) is useful on its own. (b) The scope is large because
+the problem is large — half-measures (just adding `Let` to ArithExpr) would
+hit the same walls again soon. (c) The design doc front-loads the hard
+thinking; implementation should be faster because decisions are made.
+
+### R8: Tree-sitter parser maintenance burden
+
+tree-sitter-verus must track Verus language evolution. Verus syntax changes
+(new keywords, attribute formats) will break the parser.
+
+**Mitigation**: (a) We already maintain tree-sitter-verus in this workspace.
+(b) The GPU kernel subset of Verus is small and stable (basic control flow,
+arithmetic, buffer access). (c) Changes to Verus spec syntax (ghost, proof,
+requires/ensures) don't affect us — we strip those in parsing.
+
+### R9: Target audience is small
+
+The intersection of "writes GPU kernels" and "uses formal verification" is
+tiny. Even CompCert is rarely used in industry.
+
+**Mitigation**: (a) The CuTe layout algebra is already the first of its kind
+— we're building for a new category. (b) As AI/ML accelerator code becomes
+safety-critical (autonomous vehicles, medical devices), the audience grows.
+(c) The verified transpiler could be used as infrastructure by other tools
+(e.g., a verified ML compiler) even if individual developers don't use it
+directly.
+
+---
+
+## 13. References
 
 1. Liu, Bernstein, Chlipala, Ragan-Kelley. "Verified Tensor-Program
    Optimization via High-Level Scheduling Rewrites." POPL 2022.

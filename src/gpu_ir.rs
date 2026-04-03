@@ -237,7 +237,8 @@ pub enum GpuStmt {
     BufWrite { buf: nat, idx: GpuExpr, val: GpuExpr },
     TextureStore { tex: nat, coords: GpuExpr, val: GpuExpr },
     AtomicRMW { buf: nat, idx: GpuExpr, op: AtomicOp,
-                val: GpuExpr, old_val_var: Option<nat> },
+                val: GpuExpr, compare: Option<GpuExpr>,
+                old_val_var: Option<nat> },
     ///  Function call: evaluate args, run body, store result in result_var.
     CallStmt { fn_id: nat, args: Seq<GpuExpr>, result_var: nat },
     ///  Binary sequential composition. Both children are structural sub-terms.
@@ -315,10 +316,15 @@ pub open spec fn wrap32(x: int) -> int {
     ((x + 0x8000_0000) % m + m) % m - 0x8000_0000
 }
 
-///  Apply an atomic read-modify-write operation: compute new value from old and operand.
-pub open spec fn gpu_eval_atomic_op(op: &AtomicOp, old: &GpuValue, operand: &GpuValue) -> GpuValue {
+///  Apply an atomic read-modify-write operation.
+///  Returns the NEW value to write to memory.
+///  `compare` is only used by CompareExchangeWeak.
+pub open spec fn gpu_eval_atomic_op(
+    op: &AtomicOp, old: &GpuValue, operand: &GpuValue, compare: &GpuValue,
+) -> GpuValue {
     let oi = gpu_value_to_int(old);
     let vi = gpu_value_to_int(operand);
+    let ci = gpu_value_to_int(compare);
     match op {
         AtomicOp::Load => *old,
         AtomicOp::Store => *operand,
@@ -330,7 +336,10 @@ pub open spec fn gpu_eval_atomic_op(op: &AtomicOp, old: &GpuValue, operand: &Gpu
         AtomicOp::Or => GpuValue::Int((oi as i32 | vi as i32) as int),
         AtomicOp::Xor => GpuValue::Int((oi as i32 ^ vi as i32) as int),
         AtomicOp::Exchange => *operand,
-        AtomicOp::CompareExchangeWeak => *old,  //  CAS: simplified, returns old
+        AtomicOp::CompareExchangeWeak => {
+            //  CAS: if old == compare, write operand; else leave unchanged
+            if oi == ci { *operand } else { *old }
+        },
     }
 }
 
@@ -474,10 +483,20 @@ pub open spec fn gpu_eval_expr(
         GpuExpr::Cast(ty, inner) => {
             let v = gpu_eval_expr(inner, state);
             match ty {
-                GpuType::Scalar(ScalarType::F32) =>
-                    GpuValue::Float((gpu_value_to_int(&v) as i32) as f32),
-                GpuType::Scalar(ScalarType::F16) =>
-                    GpuValue::Float((gpu_value_to_int(&v) as i32) as f32),
+                GpuType::Scalar(ScalarType::F32) => {
+                    //  If already float, pass through (f32→f32 identity).
+                    //  If int/bool, convert to float.
+                    match v {
+                        GpuValue::Float(_) => v,
+                        _ => GpuValue::Float((gpu_value_to_int(&v) as i32) as f32),
+                    }
+                },
+                GpuType::Scalar(ScalarType::F16) => {
+                    match v {
+                        GpuValue::Float(_) => v,  //  f32→f16: precision loss (modeled as identity)
+                        _ => GpuValue::Float((gpu_value_to_int(&v) as i32) as f32),
+                    }
+                },
                 GpuType::Scalar(ScalarType::I32) =>
                     GpuValue::Int(gpu_value_to_int(&v)),
                 GpuType::Scalar(ScalarType::U32) =>
@@ -670,17 +689,21 @@ pub open spec fn gpu_eval_stmt(
                     }
                 } else { state }
             },
-            GpuStmt::AtomicRMW { buf, idx, op: atomic_op, val, old_val_var } => {
+            GpuStmt::AtomicRMW { buf, idx, op: atomic_op, val, compare, old_val_var } => {
                 //  Atomic read-modify-write. Per-thread spec: read old value,
-                //  apply op(old, val) to get new value, write it back.
+                //  apply op(old, val, compare) to get new value, write it back.
                 //  The atomicity guarantee is a parallel-level property (Stage framework).
                 let i = gpu_value_to_int(&gpu_eval_expr(idx, &state));
                 let operand = gpu_eval_expr(val, &state);
+                let cmp_val = match compare {
+                    Option::Some(cmp_expr) => gpu_eval_expr(cmp_expr, &state),
+                    Option::None => GpuValue::Int(0),
+                };
                 if (*buf as int) < state.bufs.len()
                     && 0 <= i && i < state.bufs[*buf as int].len()
                 {
                     let old_val = state.bufs[*buf as int][i];
-                    let new_val = gpu_eval_atomic_op(atomic_op, &old_val, &operand);
+                    let new_val = gpu_eval_atomic_op(atomic_op, &old_val, &operand, &cmp_val);
                     //  Store old value in old_val_var if requested
                     let locals_updated = match old_val_var {
                         Option::Some(rv) => {

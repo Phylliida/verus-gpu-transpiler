@@ -85,9 +85,12 @@ pub open spec fn wgsl_unaryop(op: &GpuUnaryOp, a: &GpuValue) -> GpuValue {
     }
 }
 
-pub open spec fn wgsl_atomic_op(op: &AtomicOp, old: &GpuValue, operand: &GpuValue) -> GpuValue {
+pub open spec fn wgsl_atomic_op(
+    op: &AtomicOp, old: &GpuValue, operand: &GpuValue, compare: &GpuValue,
+) -> GpuValue {
     let oi = gpu_value_to_int(old);
     let vi = gpu_value_to_int(operand);
+    let ci = gpu_value_to_int(compare);
     match op {
         AtomicOp::Load => *old,
         AtomicOp::Store => *operand,
@@ -99,7 +102,9 @@ pub open spec fn wgsl_atomic_op(op: &AtomicOp, old: &GpuValue, operand: &GpuValu
         AtomicOp::Or => GpuValue::Int((oi as i32 | vi as i32) as int),
         AtomicOp::Xor => GpuValue::Int((oi as i32 ^ vi as i32) as int),
         AtomicOp::Exchange => *operand,
-        AtomicOp::CompareExchangeWeak => *old,
+        AtomicOp::CompareExchangeWeak => {
+            if oi == ci { *operand } else { *old }
+        },
     }
 }
 
@@ -153,10 +158,14 @@ pub open spec fn wgsl_semantics_expr(
         GpuExpr::Cast(ty, inner) => {
             let v = wgsl_semantics_expr(inner, state);
             match ty {
-                GpuType::Scalar(ScalarType::F32) =>
-                    GpuValue::Float((gpu_value_to_int(&v) as i32) as f32),
-                GpuType::Scalar(ScalarType::F16) =>
-                    GpuValue::Float((gpu_value_to_int(&v) as i32) as f32),
+                GpuType::Scalar(ScalarType::F32) => match v {
+                    GpuValue::Float(_) => v,
+                    _ => GpuValue::Float((gpu_value_to_int(&v) as i32) as f32),
+                },
+                GpuType::Scalar(ScalarType::F16) => match v {
+                    GpuValue::Float(_) => v,
+                    _ => GpuValue::Float((gpu_value_to_int(&v) as i32) as f32),
+                },
                 GpuType::Scalar(ScalarType::I32) => GpuValue::Int(gpu_value_to_int(&v)),
                 GpuType::Scalar(ScalarType::U32) => GpuValue::Int(gpu_value_to_int(&v)),
                 GpuType::Scalar(ScalarType::Bool) => GpuValue::Bool(gpu_value_truthy(&v)),
@@ -291,14 +300,18 @@ pub open spec fn wgsl_semantics_stmt(
                     state.bufs[*tex as int].update(c, v)), ..state }
             } else { state }
         },
-        GpuStmt::AtomicRMW { buf, idx, op: atomic_op, val, old_val_var } => {
+        GpuStmt::AtomicRMW { buf, idx, op: atomic_op, val, compare, old_val_var } => {
             let i = gpu_value_to_int(&wgsl_semantics_expr(idx, &state));
             let operand = wgsl_semantics_expr(val, &state);
+            let cmp_val = match compare {
+                Option::Some(cmp_expr) => wgsl_semantics_expr(cmp_expr, &state),
+                Option::None => GpuValue::Int(0),
+            };
             if (*buf as int) < state.bufs.len()
                 && 0 <= i && i < state.bufs[*buf as int].len()
             {
                 let old_val = state.bufs[*buf as int][i];
-                let new_val = wgsl_atomic_op(atomic_op, &old_val, &operand);
+                let new_val = wgsl_atomic_op(atomic_op, &old_val, &operand, &cmp_val);
                 let locals_updated = match old_val_var {
                     Option::Some(rv) => if (*rv as int) < state.locals.len() {
                         state.locals.update(*rv as int, old_val)

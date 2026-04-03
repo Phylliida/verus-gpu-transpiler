@@ -21,8 +21,8 @@ proof fn lemma_unaryop_agree(op: &GpuUnaryOp, a: &GpuValue)
     ensures gpu_eval_unaryop(op, a) == wgsl_unaryop(op, a)
 {}
 
-proof fn lemma_atomic_op_agree(op: &AtomicOp, old: &GpuValue, operand: &GpuValue)
-    ensures gpu_eval_atomic_op(op, old, operand) == wgsl_atomic_op(op, old, operand)
+proof fn lemma_atomic_op_agree(op: &AtomicOp, old: &GpuValue, operand: &GpuValue, compare: &GpuValue)
+    ensures gpu_eval_atomic_op(op, old, operand, compare) == wgsl_atomic_op(op, old, operand, compare)
 {}
 
 //  ══════════════════════════════════════════════════════════════
@@ -110,15 +110,23 @@ pub proof fn lemma_stmt_eval_eq_wgsl(
             lemma_expr_eval_eq_wgsl(coords, &state);
             lemma_expr_eval_eq_wgsl(val, &state);
         },
-        GpuStmt::AtomicRMW { buf, idx, op: atomic_op, val, old_val_var } => {
+        GpuStmt::AtomicRMW { buf, idx, op: atomic_op, val, compare, old_val_var } => {
             lemma_expr_eval_eq_wgsl(idx, &state);
             lemma_expr_eval_eq_wgsl(val, &state);
+            match compare {
+                Option::Some(cmp_expr) => { lemma_expr_eval_eq_wgsl(cmp_expr, &state); },
+                Option::None => {},
+            }
             //  Prove atomic op agrees
             let i = gpu_value_to_int(&gpu_eval_expr(idx, &state));
             if (*buf as int) < state.bufs.len() && 0 <= i && i < state.bufs[*buf as int].len() {
                 let old_val = state.bufs[*buf as int][i];
                 let operand = gpu_eval_expr(val, &state);
-                lemma_atomic_op_agree(atomic_op, &old_val, &operand);
+                let cmp_val = match compare {
+                    Option::Some(cmp_expr) => gpu_eval_expr(cmp_expr, &state),
+                    Option::None => GpuValue::Int(0),
+                };
+                lemma_atomic_op_agree(atomic_op, &old_val, &operand, &cmp_val);
             }
         },
         GpuStmt::CallStmt { fn_id, args, result_var } => {

@@ -98,10 +98,14 @@ pub open spec fn gpu_stmt_wf(
             *tex < n_bufs
             && gpu_expr_wf(coords, n_locals, n_bufs)
             && gpu_expr_wf(val, n_locals, n_bufs),
-        GpuStmt::AtomicRMW { buf, idx, op: _, val, old_val_var } =>
+        GpuStmt::AtomicRMW { buf, idx, op: _, val, compare, old_val_var } =>
             *buf < n_bufs
             && gpu_expr_wf(idx, n_locals, n_bufs)
             && gpu_expr_wf(val, n_locals, n_bufs)
+            && match compare {
+                Option::Some(cmp) => gpu_expr_wf(cmp, n_locals, n_bufs),
+                Option::None => true,
+            }
             && match old_val_var {
                 Option::Some(v) => *v < n_locals,
                 Option::None => true,

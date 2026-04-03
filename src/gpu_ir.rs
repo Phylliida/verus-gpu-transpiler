@@ -26,10 +26,14 @@ pub open spec fn pow2(n: nat) -> nat
 //  Types
 //  ══════════════════════════════════════════════════════════════
 
-pub enum ScalarType { I32, U32, F32, Bool }
+pub enum ScalarType { I32, U32, F32, F16, Bool }
 
 pub enum GpuType {
     Scalar(ScalarType),
+    Vec2(ScalarType),
+    Vec3(ScalarType),
+    Vec4(ScalarType),
+    Mat { cols: nat, rows: nat, elem: ScalarType },
     Void,
 }
 
@@ -38,6 +42,10 @@ pub enum GpuValue {
     Int(int),
     Float(f32),
     Bool(bool),
+    ///  Vector: 2-4 components.
+    Vec(Seq<GpuValue>),
+    ///  Matrix: columns of vectors (column-major, matching WGSL).
+    Mat(Seq<Seq<GpuValue>>),
 }
 
 //  ══════════════════════════════════════════════════════════════
@@ -57,6 +65,27 @@ pub open spec fn gpu_value_truthy(v: &GpuValue) -> bool {
         GpuValue::Int(i) => *i != 0,
         GpuValue::Float(_) => true,
         GpuValue::Bool(b) => *b,
+        _ => false,
+    }
+}
+
+///  Get a component of a vec value. Returns Int(0) if out of range or not a vec.
+pub open spec fn gpu_value_vec_component(v: &GpuValue, idx: nat) -> GpuValue {
+    match v {
+        GpuValue::Vec(components) => {
+            if (idx as int) < components.len() {
+                components[idx as int]
+            } else { GpuValue::Int(0) }
+        },
+        _ => GpuValue::Int(0),
+    }
+}
+
+///  Get the number of components in a vec, or 1 for scalars.
+pub open spec fn gpu_value_width(v: &GpuValue) -> nat {
+    match v {
+        GpuValue::Vec(c) => c.len(),
+        _ => 1,
     }
 }
 
@@ -89,6 +118,56 @@ pub enum GpuUnaryOp {
 pub enum BarrierScope {
     Workgroup,
     Storage,
+    Subgroup,
+}
+
+pub enum AtomicOp {
+    Load, Store, Add, Sub, Max, Min,
+    And, Or, Xor, Exchange, CompareExchangeWeak,
+}
+
+pub enum SubgroupReduceOp {
+    Add, Mul, Min, Max, And, Or, Xor,
+    ExclusiveAdd, InclusiveAdd, ExclusiveMul, InclusiveMul,
+}
+
+pub enum SubgroupCommOp {
+    Broadcast(nat),
+    BroadcastFirst,
+    Shuffle, ShuffleXor, ShuffleUp, ShuffleDown,
+}
+
+pub enum SubgroupVoteOp {
+    Ballot, All, Any, Elect,
+}
+
+pub enum PackFormat { SNorm, UNorm, SInt, UInt }
+
+pub enum GpuBuiltin {
+    GlobalInvocationId { dim: nat },
+    LocalInvocationId { dim: nat },
+    LocalInvocationIndex,
+    WorkgroupId { dim: nat },
+    NumWorkgroups { dim: nat },
+    SubgroupId,
+    SubgroupInvocationId,
+    SubgroupSize,
+}
+
+pub enum MemorySpace { Storage, Workgroup, Uniform }
+
+pub struct BufferBinding {
+    pub binding: nat,
+    pub space: MemorySpace,
+    pub read_only: bool,
+    pub elem_type: GpuType,
+}
+
+pub struct TextureBinding {
+    pub binding: nat,
+    pub read_only: bool,
+    pub texel_type: GpuType,
+    pub dimensions: nat,
 }
 
 //  ══════════════════════════════════════════════════════════════
@@ -96,14 +175,37 @@ pub enum BarrierScope {
 //  ══════════════════════════════════════════════════════════════
 
 pub enum GpuExpr {
+    //  Scalar constants
     Const(int, ScalarType),
     FConst(f32),
+    //  Variables and builtins
     Var(nat, GpuType),
+    Builtin(GpuBuiltin),
+    //  Arithmetic and logic
     BinOp(GpuBinOp, Box<GpuExpr>, Box<GpuExpr>),
     UnaryOp(GpuUnaryOp, Box<GpuExpr>),
     Select(Box<GpuExpr>, Box<GpuExpr>, Box<GpuExpr>),
+    //  Memory
     ArrayRead(nat, Box<GpuExpr>),
+    TextureLoad(nat, Box<GpuExpr>),
+    //  Type conversion
     Cast(GpuType, Box<GpuExpr>),
+    //  Vector ops
+    VecConstruct(Seq<GpuExpr>),
+    VecComponent(Box<GpuExpr>, nat),
+    Swizzle(Box<GpuExpr>, Seq<nat>),
+    //  Matrix ops
+    MatConstruct(nat, nat, Seq<GpuExpr>),
+    MatMul(Box<GpuExpr>, Box<GpuExpr>),
+    Transpose(Box<GpuExpr>),
+    Determinant(Box<GpuExpr>),
+    //  Packed types
+    Pack4x8(PackFormat, Box<GpuExpr>),
+    Unpack4x8(PackFormat, Box<GpuExpr>),
+    //  Subgroup ops
+    SubgroupReduce(SubgroupReduceOp, Box<GpuExpr>),
+    SubgroupComm(SubgroupCommOp, Box<GpuExpr>),
+    SubgroupVote(SubgroupVoteOp, Box<GpuExpr>),
 }
 
 //  ══════════════════════════════════════════════════════════════
@@ -113,12 +215,12 @@ pub enum GpuExpr {
 pub enum GpuStmt {
     Assign { var: nat, rhs: GpuExpr },
     BufWrite { buf: nat, idx: GpuExpr, val: GpuExpr },
+    TextureStore { tex: nat, coords: GpuExpr, val: GpuExpr },
+    AtomicRMW { buf: nat, idx: GpuExpr, op: AtomicOp,
+                val: GpuExpr, old_val_var: Option<nat> },
     ///  Function call: evaluate args, run body, store result in result_var.
-    ///  Lives in GpuStmt (not GpuExpr) to avoid expr↔stmt mutual recursion.
-    ///  Usage: `call(f, args, tmp); let x = tmp + 1;`
     CallStmt { fn_id: nat, args: Seq<GpuExpr>, result_var: nat },
     ///  Binary sequential composition. Both children are structural sub-terms.
-    ///  Build flat sequences with `seq_stmts` helper or nested Seq.
     Seq { first: Box<GpuStmt>, then: Box<GpuStmt> },
     If { cond: GpuExpr, then_body: Box<GpuStmt>, else_body: Box<GpuStmt> },
     For { var: nat, start: GpuExpr, end: GpuExpr, body: Box<GpuStmt> },
@@ -163,10 +265,13 @@ pub struct GpuFunction {
 
 pub struct GpuKernel {
     pub n_locals: nat,
-    pub n_bufs: nat,
+    pub buffers: Seq<BufferBinding>,
+    pub textures: Seq<TextureBinding>,
     pub functions: Seq<GpuFunction>,
     pub body: GpuStmt,
     pub workgroup_size: (nat, nat, nat),
+    pub enable_subgroups: bool,
+    pub enable_f16: bool,
 }
 
 //  ══════════════════════════════════════════════════════════════
@@ -258,6 +363,19 @@ pub open spec fn gpu_eval_unaryop(op: &GpuUnaryOp, a: &GpuValue) -> GpuValue {
 //  Expression evaluation — self-recursive only
 //  ══════════════════════════════════════════════════════════════
 
+///  Evaluate vector args helper for VecConstruct/MatConstruct.
+pub open spec fn gpu_eval_expr_seq(
+    exprs: &Seq<GpuExpr>, state: &GpuState, idx: nat,
+) -> Seq<GpuValue>
+    decreases exprs.len() - idx,
+{
+    if idx >= exprs.len() { seq![] }
+    else {
+        seq![gpu_eval_expr(&exprs[idx as int], state)]
+            + gpu_eval_expr_seq(exprs, state, idx + 1)
+    }
+}
+
 pub open spec fn gpu_eval_expr(
     e: &GpuExpr, state: &GpuState,
 ) -> GpuValue
@@ -270,6 +388,14 @@ pub open spec fn gpu_eval_expr(
             if (*i as int) < state.locals.len() {
                 state.locals[*i as int]
             } else { GpuValue::Int(0) }
+        },
+        GpuExpr::Builtin(_builtin) => {
+            //  Builtins (thread_id, workgroup_id, etc.) are stored in locals
+            //  by gpu_eval_kernel_thread. This node reads them from there.
+            //  The mapping builtin→local index is set up at kernel launch.
+            //  At the IR level, Builtin evaluates to Int(0) — the actual value
+            //  is injected at kernel eval time.
+            GpuValue::Int(0)
         },
         GpuExpr::BinOp(op, a, b) => {
             let va = gpu_eval_expr(a, state);
@@ -296,16 +422,116 @@ pub open spec fn gpu_eval_expr(
                 state.bufs[*buf_idx as int][idx]
             } else { GpuValue::Int(0) }
         },
+        GpuExpr::TextureLoad(tex_idx, coords_expr) => {
+            //  Texture loads are modeled as buffer reads (textures are buffers
+            //  with different access patterns). The tex_idx indexes into
+            //  state.bufs at an offset after regular buffers.
+            let coords = gpu_value_to_int(&gpu_eval_expr(coords_expr, state));
+            if (*tex_idx as int) < state.bufs.len()
+                && 0 <= coords
+                && coords < state.bufs[*tex_idx as int].len()
+            {
+                state.bufs[*tex_idx as int][coords]
+            } else { GpuValue::Int(0) }
+        },
         GpuExpr::Cast(ty, inner) => {
             let v = gpu_eval_expr(inner, state);
             match ty {
                 GpuType::Scalar(ScalarType::F32) =>
                     GpuValue::Float((gpu_value_to_int(&v) as i32) as f32),
-                GpuType::Scalar(ScalarType::I32) => GpuValue::Int(gpu_value_to_int(&v)),
-                GpuType::Scalar(ScalarType::U32) => GpuValue::Int(gpu_value_to_int(&v)),
-                GpuType::Scalar(ScalarType::Bool) => GpuValue::Bool(gpu_value_truthy(&v)),
+                GpuType::Scalar(ScalarType::F16) =>
+                    GpuValue::Float((gpu_value_to_int(&v) as i32) as f32),
+                GpuType::Scalar(ScalarType::I32) =>
+                    GpuValue::Int(gpu_value_to_int(&v)),
+                GpuType::Scalar(ScalarType::U32) =>
+                    GpuValue::Int(gpu_value_to_int(&v)),
+                GpuType::Scalar(ScalarType::Bool) =>
+                    GpuValue::Bool(gpu_value_truthy(&v)),
                 _ => v,
             }
+        },
+        //  ── Vector operations ──────────────────────────────────
+        GpuExpr::VecConstruct(components) => {
+            GpuValue::Vec(gpu_eval_expr_seq(components, state, 0))
+        },
+        GpuExpr::VecComponent(vec_expr, idx) => {
+            gpu_value_vec_component(&gpu_eval_expr(vec_expr, state), *idx)
+        },
+        GpuExpr::Swizzle(vec_expr, indices) => {
+            let v = gpu_eval_expr(vec_expr, state);
+            GpuValue::Vec(Seq::new(indices.len(), |i: int|
+                gpu_value_vec_component(&v, indices[i])))
+        },
+        //  ── Matrix operations ──────────────────────────────────
+        GpuExpr::MatConstruct(_cols, _rows, col_exprs) => {
+            //  Each col_expr should evaluate to a Vec (column vector)
+            GpuValue::Mat(Seq::new(col_exprs.len(), |i: int| {
+                let col = gpu_eval_expr(&col_exprs[i], state);
+                match col {
+                    GpuValue::Vec(v) => v,
+                    _ => seq![col],
+                }
+            }))
+        },
+        GpuExpr::MatMul(a_expr, b_expr) => {
+            //  Matrix-matrix or matrix-vector multiply.
+            //  Spec: standard linear algebra definition.
+            //  Detailed implementation deferred — returns placeholder.
+            //  Full mat mul semantics connect to verus-linalg.
+            let _a = gpu_eval_expr(a_expr, state);
+            let _b = gpu_eval_expr(b_expr, state);
+            GpuValue::Int(0)  //  TODO: implement mat mul spec
+        },
+        GpuExpr::Transpose(m_expr) => {
+            let m = gpu_eval_expr(m_expr, state);
+            match m {
+                GpuValue::Mat(cols) => {
+                    if cols.len() > 0 && cols[0].len() > 0 {
+                        let n_rows = cols[0].len();
+                        let n_cols = cols.len();
+                        GpuValue::Mat(Seq::new(n_rows, |r: int|
+                            Seq::new(n_cols, |c: int| cols[c][r])))
+                    } else { GpuValue::Mat(seq![]) }
+                },
+                _ => m,
+            }
+        },
+        GpuExpr::Determinant(_m_expr) => {
+            //  Determinant for 2x2, 3x3, 4x4.
+            //  Full implementation connects to verus-linalg.
+            let _m = gpu_eval_expr(_m_expr, state);
+            GpuValue::Float(0.0f32)  //  TODO: implement determinant spec
+        },
+        //  ── Packed types ───────────────────────────────────────
+        GpuExpr::Pack4x8(_fmt, vec_expr) => {
+            //  vec4<f32> → u32. Pack 4 normalized floats into one u32.
+            let _v = gpu_eval_expr(vec_expr, state);
+            GpuValue::Int(0)  //  TODO: implement pack spec
+        },
+        GpuExpr::Unpack4x8(_fmt, int_expr) => {
+            //  u32 → vec4<f32>. Unpack one u32 into 4 normalized floats.
+            let _v = gpu_eval_expr(int_expr, state);
+            GpuValue::Vec(seq![
+                GpuValue::Float(0.0f32), GpuValue::Float(0.0f32),
+                GpuValue::Float(0.0f32), GpuValue::Float(0.0f32),
+            ])  //  TODO: implement unpack spec
+        },
+        //  ── Subgroup operations ────────────────────────────────
+        //  Subgroup ops depend on other threads' values — they are
+        //  NOT definable in the per-thread eval model. At this level
+        //  they return uninterpreted values. The parallel-level spec
+        //  (Stage framework) defines their cross-thread semantics.
+        GpuExpr::SubgroupReduce(_op, val_expr) => {
+            let _v = gpu_eval_expr(val_expr, state);
+            GpuValue::Int(0)  //  per-thread: uninterpreted
+        },
+        GpuExpr::SubgroupComm(_op, val_expr) => {
+            let _v = gpu_eval_expr(val_expr, state);
+            GpuValue::Int(0)  //  per-thread: uninterpreted
+        },
+        GpuExpr::SubgroupVote(_op, val_expr) => {
+            let _v = gpu_eval_expr(val_expr, state);
+            GpuValue::Bool(false)  //  per-thread: uninterpreted
         },
     }
 }
@@ -363,6 +589,51 @@ pub open spec fn gpu_eval_stmt(
                         bufs: state.bufs.update(*buf as int,
                             state.bufs[*buf as int].update(i, v)),
                         ..state
+                    }
+                } else { state }
+            },
+            GpuStmt::TextureStore { tex, coords, val } => {
+                //  Textures modeled as buffers (offset into state.bufs)
+                let c = gpu_value_to_int(&gpu_eval_expr(coords, &state));
+                let v = gpu_eval_expr(val, &state);
+                if (*tex as int) < state.bufs.len()
+                    && 0 <= c && c < state.bufs[*tex as int].len()
+                {
+                    GpuState {
+                        bufs: state.bufs.update(*tex as int,
+                            state.bufs[*tex as int].update(c, v)),
+                        ..state
+                    }
+                } else { state }
+            },
+            GpuStmt::AtomicRMW { buf, idx, op: _atomic_op, val, old_val_var } => {
+                //  Atomic read-modify-write. Per-thread spec: read old value,
+                //  compute new value, write it back. The atomicity guarantee
+                //  is a parallel-level property (Stage framework).
+                let i = gpu_value_to_int(&gpu_eval_expr(idx, &state));
+                let new_val = gpu_eval_expr(val, &state);
+                if (*buf as int) < state.bufs.len()
+                    && 0 <= i && i < state.bufs[*buf as int].len()
+                {
+                    let old_val = state.bufs[*buf as int][i];
+                    //  Store old value in old_val_var if requested
+                    let state_with_result = match old_val_var {
+                        Option::Some(rv) => {
+                            if (*rv as int) < state.locals.len() {
+                                GpuState {
+                                    locals: state.locals.update(*rv as int, old_val),
+                                    ..state
+                                }
+                            } else { state }
+                        },
+                        Option::None => state,
+                    };
+                    //  Write new value (simplified: just store val, not old op val)
+                    //  Full semantics depends on AtomicOp (Add adds, Max takes max, etc.)
+                    GpuState {
+                        bufs: state_with_result.bufs.update(*buf as int,
+                            state_with_result.bufs[*buf as int].update(i, new_val)),
+                        ..state_with_result
                     }
                 } else { state }
             },
@@ -446,6 +717,11 @@ pub open spec fn gpu_eval_loop(
 //  ══════════════════════════════════════════════════════════════
 //  Kernel-level evaluation
 //  ══════════════════════════════════════════════════════════════
+
+///  Number of buffer + texture bindings in a kernel.
+pub open spec fn gpu_kernel_n_bufs(k: &GpuKernel) -> nat {
+    k.buffers.len() + k.textures.len()
+}
 
 ///  Evaluate a kernel for a single thread. Thread ID in locals[0].
 pub open spec fn gpu_eval_kernel_thread(

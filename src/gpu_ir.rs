@@ -55,11 +55,25 @@ pub enum GpuValue {
 pub open spec fn gpu_value_to_int(v: &GpuValue) -> int {
     match v {
         GpuValue::Int(i) => *i,
-        GpuValue::Float(_) => 0,
+        GpuValue::Float(f) => (*f as i32) as int,  //  truncate float → int
         GpuValue::Bool(b) => if *b { 1 } else { 0 },
         GpuValue::Vec(_) => 0,
         GpuValue::Mat(_) => 0,
     }
+}
+
+///  Extract float from a GpuValue. Converts int → float if needed.
+pub open spec fn gpu_value_to_float(v: &GpuValue) -> f32 {
+    match v {
+        GpuValue::Float(f) => *f,
+        GpuValue::Int(i) => (*i as i32) as f32,
+        _ => 0.0f32,
+    }
+}
+
+///  Check if a value is a float type.
+pub open spec fn gpu_value_is_float(v: &GpuValue) -> bool {
+    matches!(*v, GpuValue::Float(_))
 }
 
 pub open spec fn gpu_value_truthy(v: &GpuValue) -> bool {
@@ -182,7 +196,11 @@ pub enum GpuExpr {
     FConst(f32),
     //  Variables and builtins
     Var(nat, GpuType),
-    Builtin(GpuBuiltin),
+    ///  Builtin value (thread_id, workgroup_id, etc.).
+    ///  `local_idx` is the local variable slot where the kernel launcher
+    ///  stores this builtin's value. The `which` field is metadata for
+    ///  the emitter (maps to gid.x, lid.y, etc.).
+    Builtin { which: GpuBuiltin, local_idx: nat },
     //  Arithmetic and logic
     BinOp(GpuBinOp, Box<GpuExpr>, Box<GpuExpr>),
     UnaryOp(GpuUnaryOp, Box<GpuExpr>),
@@ -297,6 +315,25 @@ pub open spec fn wrap32(x: int) -> int {
     ((x + 0x8000_0000) % m + m) % m - 0x8000_0000
 }
 
+///  Apply an atomic read-modify-write operation: compute new value from old and operand.
+pub open spec fn gpu_eval_atomic_op(op: &AtomicOp, old: &GpuValue, operand: &GpuValue) -> GpuValue {
+    let oi = gpu_value_to_int(old);
+    let vi = gpu_value_to_int(operand);
+    match op {
+        AtomicOp::Load => *old,
+        AtomicOp::Store => *operand,
+        AtomicOp::Add => GpuValue::Int(oi + vi),
+        AtomicOp::Sub => GpuValue::Int(oi - vi),
+        AtomicOp::Max => GpuValue::Int(if oi >= vi { oi } else { vi }),
+        AtomicOp::Min => GpuValue::Int(if oi <= vi { oi } else { vi }),
+        AtomicOp::And => GpuValue::Int((oi as i32 & vi as i32) as int),
+        AtomicOp::Or => GpuValue::Int((oi as i32 | vi as i32) as int),
+        AtomicOp::Xor => GpuValue::Int((oi as i32 ^ vi as i32) as int),
+        AtomicOp::Exchange => *operand,
+        AtomicOp::CompareExchangeWeak => *old,  //  CAS: simplified, returns old
+    }
+}
+
 //  ══════════════════════════════════════════════════════════════
 //  Binary operator evaluation
 //  ══════════════════════════════════════════════════════════════
@@ -333,12 +370,25 @@ pub open spec fn gpu_eval_binop(op: &GpuBinOp, a: &GpuValue, b: &GpuValue) -> Gp
             (GpuValue::Float(fa), GpuValue::Float(fb)) => GpuValue::Float(*fa / *fb),
             _ => GpuValue::Float(0.0f32),
         },
-        GpuBinOp::Lt => GpuValue::Bool(ai < bi),
-        GpuBinOp::Le => GpuValue::Bool(ai <= bi),
-        GpuBinOp::Gt => GpuValue::Bool(ai > bi),
-        GpuBinOp::Ge => GpuValue::Bool(ai >= bi),
-        GpuBinOp::Eq => GpuValue::Bool(ai == bi),
-        GpuBinOp::Ne => GpuValue::Bool(ai != bi),
+        //  Comparisons: dispatch on float vs int
+        GpuBinOp::Lt => if gpu_value_is_float(a) || gpu_value_is_float(b) {
+            GpuValue::Bool(gpu_value_to_float(a) < gpu_value_to_float(b))
+        } else { GpuValue::Bool(ai < bi) },
+        GpuBinOp::Le => if gpu_value_is_float(a) || gpu_value_is_float(b) {
+            GpuValue::Bool(gpu_value_to_float(a) <= gpu_value_to_float(b))
+        } else { GpuValue::Bool(ai <= bi) },
+        GpuBinOp::Gt => if gpu_value_is_float(a) || gpu_value_is_float(b) {
+            GpuValue::Bool(gpu_value_to_float(a) > gpu_value_to_float(b))
+        } else { GpuValue::Bool(ai > bi) },
+        GpuBinOp::Ge => if gpu_value_is_float(a) || gpu_value_is_float(b) {
+            GpuValue::Bool(gpu_value_to_float(a) >= gpu_value_to_float(b))
+        } else { GpuValue::Bool(ai >= bi) },
+        GpuBinOp::Eq => if gpu_value_is_float(a) || gpu_value_is_float(b) {
+            GpuValue::Bool(gpu_value_to_float(a) == gpu_value_to_float(b))
+        } else { GpuValue::Bool(ai == bi) },
+        GpuBinOp::Ne => if gpu_value_is_float(a) || gpu_value_is_float(b) {
+            GpuValue::Bool(gpu_value_to_float(a) != gpu_value_to_float(b))
+        } else { GpuValue::Bool(ai != bi) },
         GpuBinOp::BitAnd => GpuValue::Int((ai as i32 & bi as i32) as int),
         GpuBinOp::BitOr => GpuValue::Int((ai as i32 | bi as i32) as int),
         GpuBinOp::BitXor => GpuValue::Int((ai as i32 ^ bi as i32) as int),
@@ -378,13 +428,11 @@ pub open spec fn gpu_eval_expr(
                 state.locals[*i as int]
             } else { GpuValue::Int(0) }
         },
-        GpuExpr::Builtin(_builtin) => {
-            //  Builtins (thread_id, workgroup_id, etc.) are stored in locals
-            //  by gpu_eval_kernel_thread. This node reads them from there.
-            //  The mapping builtin→local index is set up at kernel launch.
-            //  At the IR level, Builtin evaluates to Int(0) — the actual value
-            //  is injected at kernel eval time.
-            GpuValue::Int(0)
+        GpuExpr::Builtin { which: _, local_idx } => {
+            //  Builtins read from the local variable slot assigned at kernel launch.
+            if (*local_idx as int) < state.locals.len() {
+                state.locals[*local_idx as int]
+            } else { GpuValue::Int(0) }
         },
         GpuExpr::BinOp(op, a, b) => {
             let va = gpu_eval_expr(a, state);
@@ -579,10 +627,12 @@ pub open spec fn gpu_eval_expr(
 //  stmt→stmt (Seq/If): children are sub-terms, so strictly smaller. ✓
 //  ══════════════════════════════════════════════════════════════
 
+///  `fuel` bounds function call depth. At fuel 0, CallStmt returns default.
+///  Loops and structural recursion are NOT bounded by fuel — only function calls.
 pub open spec fn gpu_eval_stmt(
-    s: &GpuStmt, state: GpuState, fns: &Seq<GpuFunction>,
+    s: &GpuStmt, state: GpuState, fns: &Seq<GpuFunction>, fuel: nat,
 ) -> GpuState
-    decreases s, 0nat,
+    decreases fuel, s, 0nat,
 {
     if state.returned || state.broken { state }
     else {
@@ -620,54 +670,79 @@ pub open spec fn gpu_eval_stmt(
                     }
                 } else { state }
             },
-            GpuStmt::AtomicRMW { buf, idx, op: _atomic_op, val, old_val_var } => {
+            GpuStmt::AtomicRMW { buf, idx, op: atomic_op, val, old_val_var } => {
                 //  Atomic read-modify-write. Per-thread spec: read old value,
-                //  compute new value, write it back. The atomicity guarantee
-                //  is a parallel-level property (Stage framework).
+                //  apply op(old, val) to get new value, write it back.
+                //  The atomicity guarantee is a parallel-level property (Stage framework).
                 let i = gpu_value_to_int(&gpu_eval_expr(idx, &state));
-                let new_val = gpu_eval_expr(val, &state);
+                let operand = gpu_eval_expr(val, &state);
                 if (*buf as int) < state.bufs.len()
                     && 0 <= i && i < state.bufs[*buf as int].len()
                 {
                     let old_val = state.bufs[*buf as int][i];
+                    let new_val = gpu_eval_atomic_op(atomic_op, &old_val, &operand);
                     //  Store old value in old_val_var if requested
-                    let state_with_result = match old_val_var {
+                    let locals_updated = match old_val_var {
                         Option::Some(rv) => {
                             if (*rv as int) < state.locals.len() {
-                                GpuState {
-                                    locals: state.locals.update(*rv as int, old_val),
-                                    ..state
-                                }
-                            } else { state }
+                                state.locals.update(*rv as int, old_val)
+                            } else { state.locals }
                         },
-                        Option::None => state,
+                        Option::None => state.locals,
                     };
-                    //  Write new value (simplified: just store val, not old op val)
-                    //  Full semantics depends on AtomicOp (Add adds, Max takes max, etc.)
                     GpuState {
-                        bufs: state_with_result.bufs.update(*buf as int,
-                            state_with_result.bufs[*buf as int].update(i, new_val)),
-                        ..state_with_result
+                        locals: locals_updated,
+                        bufs: state.bufs.update(*buf as int,
+                            state.bufs[*buf as int].update(i, new_val)),
+                        ..state
                     }
                 } else { state }
             },
             GpuStmt::CallStmt { fn_id, args, result_var } => {
-                if (*fn_id as int) < fns.len() {
+                if fuel == 0 || !((*fn_id as int) < fns.len()) {
+                    state  //  out of fuel or invalid fn_id
+                } else {
                     let f = &fns[*fn_id as int];
-                    //  Evaluate args (can't use Seq::new — termination issue)
-                    //  CallStmt args are typically few, so explicit is fine.
-                    //  For > 4 args, the function body placeholder returns default anyway.
+                    //  Evaluate args (explicit unroll for 0-8 args)
                     let arg_vals: Seq<GpuValue> =
                         if args.len() == 0 { seq![] }
                         else if args.len() == 1 { seq![gpu_eval_expr(&args[0], &state)] }
                         else if args.len() == 2 { seq![gpu_eval_expr(&args[0], &state),
                             gpu_eval_expr(&args[1], &state)] }
                         else if args.len() == 3 { seq![gpu_eval_expr(&args[0], &state),
-                            gpu_eval_expr(&args[1], &state), gpu_eval_expr(&args[2], &state)] }
+                            gpu_eval_expr(&args[1], &state),
+                            gpu_eval_expr(&args[2], &state)] }
                         else if args.len() == 4 { seq![gpu_eval_expr(&args[0], &state),
-                            gpu_eval_expr(&args[1], &state), gpu_eval_expr(&args[2], &state),
+                            gpu_eval_expr(&args[1], &state),
+                            gpu_eval_expr(&args[2], &state),
                             gpu_eval_expr(&args[3], &state)] }
-                        else { seq![] };  // TODO: support > 4 args via fuel
+                        else if args.len() == 5 { seq![gpu_eval_expr(&args[0], &state),
+                            gpu_eval_expr(&args[1], &state),
+                            gpu_eval_expr(&args[2], &state),
+                            gpu_eval_expr(&args[3], &state),
+                            gpu_eval_expr(&args[4], &state)] }
+                        else if args.len() == 6 { seq![gpu_eval_expr(&args[0], &state),
+                            gpu_eval_expr(&args[1], &state),
+                            gpu_eval_expr(&args[2], &state),
+                            gpu_eval_expr(&args[3], &state),
+                            gpu_eval_expr(&args[4], &state),
+                            gpu_eval_expr(&args[5], &state)] }
+                        else if args.len() == 7 { seq![gpu_eval_expr(&args[0], &state),
+                            gpu_eval_expr(&args[1], &state),
+                            gpu_eval_expr(&args[2], &state),
+                            gpu_eval_expr(&args[3], &state),
+                            gpu_eval_expr(&args[4], &state),
+                            gpu_eval_expr(&args[5], &state),
+                            gpu_eval_expr(&args[6], &state)] }
+                        else if args.len() == 8 { seq![gpu_eval_expr(&args[0], &state),
+                            gpu_eval_expr(&args[1], &state),
+                            gpu_eval_expr(&args[2], &state),
+                            gpu_eval_expr(&args[3], &state),
+                            gpu_eval_expr(&args[4], &state),
+                            gpu_eval_expr(&args[5], &state),
+                            gpu_eval_expr(&args[6], &state),
+                            gpu_eval_expr(&args[7], &state)] }
+                        else { seq![] };  //  >8 args: unsupported
                     let fn_locals = Seq::new(f.n_locals, |i: int|
                         if i < arg_vals.len() { arg_vals[i] }
                         else { GpuValue::Int(0) });
@@ -675,39 +750,37 @@ pub open spec fn gpu_eval_stmt(
                         locals: fn_locals, bufs: state.bufs,
                         returned: false, broken: false,
                     };
-                    //  NOTE: f.body is NOT a sub-term of s. This call is NOT
-                    //  structurally decreasing. We need a separate mechanism
-                    //  (fuel/depth counter) to handle function calls.
-                    //  For Phase 1a: support non-recursive calls only by
-                    //  using a depth counter.
-                    //  TODO: add fuel parameter for function call depth
-                    let result_state = fn_state;  //  placeholder: no eval yet
+                    //  Evaluate function body with fuel-1 (decreases fuel)
+                    let result_state = gpu_eval_stmt(&f.body, fn_state, fns, (fuel - 1) as nat);
                     let ret_val = if (f.ret_var as int) < result_state.locals.len() {
                         result_state.locals[f.ret_var as int]
                     } else { GpuValue::Int(0) };
                     if (*result_var as int) < state.locals.len() {
                         GpuState {
                             locals: state.locals.update(*result_var as int, ret_val),
+                            bufs: result_state.bufs,  //  function may modify buffers
                             ..state
                         }
-                    } else { state }
-                } else { state }
+                    } else {
+                        GpuState { bufs: result_state.bufs, ..state }
+                    }
+                }
             },
             GpuStmt::Seq { first, then } => {
-                let mid = gpu_eval_stmt(first, state, fns);
-                gpu_eval_stmt(then, mid, fns)
+                let mid = gpu_eval_stmt(first, state, fns, fuel);
+                gpu_eval_stmt(then, mid, fns, fuel)
             },
             GpuStmt::If { cond, then_body, else_body } => {
                 if gpu_value_truthy(&gpu_eval_expr(cond, &state)) {
-                    gpu_eval_stmt(then_body, state, fns)
+                    gpu_eval_stmt(then_body, state, fns, fuel)
                 } else {
-                    gpu_eval_stmt(else_body, state, fns)
+                    gpu_eval_stmt(else_body, state, fns, fuel)
                 }
             },
             GpuStmt::For { var, start, end, body } => {
                 let s_val = gpu_value_to_int(&gpu_eval_expr(start, &state));
                 let e_val = gpu_value_to_int(&gpu_eval_expr(end, &state));
-                let result = gpu_eval_loop(*var, s_val, e_val, body, state, fns);
+                let result = gpu_eval_loop(*var, s_val, e_val, body, state, fns, fuel);
                 GpuState { broken: false, ..result }
             },
             GpuStmt::Break => GpuState { broken: true, ..state },
@@ -723,9 +796,9 @@ pub open spec fn gpu_eval_stmt(
 pub open spec fn gpu_eval_loop(
     var: nat, current: int, end: int,
     body: &GpuStmt, state: GpuState,
-    fns: &Seq<GpuFunction>,
+    fns: &Seq<GpuFunction>, fuel: nat,
 ) -> GpuState
-    decreases body, (if end > current { (end - current) as nat } else { 0nat }),
+    decreases fuel, body, (if end > current { (end - current) as nat } else { 0nat }),
 {
     if current >= end || state.returned || state.broken {
         state
@@ -736,8 +809,8 @@ pub open spec fn gpu_eval_loop(
                 ..state
             }
         } else { state };
-        let s2 = gpu_eval_stmt(body, s, fns);
-        gpu_eval_loop(var, current + 1, end, body, s2, fns)
+        let s2 = gpu_eval_stmt(body, s, fns, fuel);
+        gpu_eval_loop(var, current + 1, end, body, s2, fns, fuel)
     }
 }
 
@@ -750,14 +823,24 @@ pub open spec fn gpu_kernel_n_bufs(k: &GpuKernel) -> nat {
     k.buffers.len() + k.textures.len()
 }
 
+///  Default fuel for function calls (sufficient for non-recursive call chains).
+pub open spec fn default_fuel() -> nat { 16 }
+
 ///  Evaluate a kernel for a single thread. Thread ID in locals[0].
 pub open spec fn gpu_eval_kernel_thread(
     k: &GpuKernel, tid: nat, bufs: Seq<Seq<GpuValue>>,
 ) -> GpuState {
+    gpu_eval_kernel_thread_fuel(k, tid, bufs, default_fuel())
+}
+
+///  Evaluate a kernel with explicit fuel for function call depth.
+pub open spec fn gpu_eval_kernel_thread_fuel(
+    k: &GpuKernel, tid: nat, bufs: Seq<Seq<GpuValue>>, fuel: nat,
+) -> GpuState {
     let locals = Seq::new(k.n_locals, |_i: int| GpuValue::Int(0))
         .update(0, GpuValue::Int(tid as int));
     let init = GpuState { locals, bufs, returned: false, broken: false };
-    gpu_eval_stmt(&k.body, init, &k.functions)
+    gpu_eval_stmt(&k.body, init, &k.functions, fuel)
 }
 
 } // verus!

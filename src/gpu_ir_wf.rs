@@ -22,6 +22,7 @@ pub open spec fn gpu_expr_wf(e: &GpuExpr, n_locals: nat, n_bufs: nat) -> bool
         GpuExpr::Const(_, _) => true,
         GpuExpr::FConst(_) => true,
         GpuExpr::Var(i, _) => *i < n_locals,
+        GpuExpr::Builtin(_) => true,
         GpuExpr::BinOp(_, a, b) =>
             gpu_expr_wf(a, n_locals, n_bufs)
             && gpu_expr_wf(b, n_locals, n_bufs),
@@ -34,8 +35,41 @@ pub open spec fn gpu_expr_wf(e: &GpuExpr, n_locals: nat, n_bufs: nat) -> bool
         GpuExpr::ArrayRead(buf_idx, idx_expr) =>
             *buf_idx < n_bufs
             && gpu_expr_wf(idx_expr, n_locals, n_bufs),
+        GpuExpr::TextureLoad(tex_idx, coords_expr) =>
+            *tex_idx < n_bufs
+            && gpu_expr_wf(coords_expr, n_locals, n_bufs),
         GpuExpr::Cast(_, inner) =>
             gpu_expr_wf(inner, n_locals, n_bufs),
+        GpuExpr::VecConstruct(components) =>
+            components.len() >= 2 && components.len() <= 4
+            && gpu_args_wf(components, n_locals, n_bufs, 0),
+        GpuExpr::VecComponent(vec_expr, idx) =>
+            *idx < 4
+            && gpu_expr_wf(vec_expr, n_locals, n_bufs),
+        GpuExpr::Swizzle(vec_expr, indices) =>
+            indices.len() >= 1 && indices.len() <= 4
+            && gpu_expr_wf(vec_expr, n_locals, n_bufs),
+        GpuExpr::MatConstruct(cols, rows, col_exprs) =>
+            *cols >= 2 && *cols <= 4 && *rows >= 2 && *rows <= 4
+            && col_exprs.len() == *cols as int
+            && gpu_args_wf(col_exprs, n_locals, n_bufs, 0),
+        GpuExpr::MatMul(a, b) =>
+            gpu_expr_wf(a, n_locals, n_bufs)
+            && gpu_expr_wf(b, n_locals, n_bufs),
+        GpuExpr::Transpose(m) =>
+            gpu_expr_wf(m, n_locals, n_bufs),
+        GpuExpr::Determinant(m) =>
+            gpu_expr_wf(m, n_locals, n_bufs),
+        GpuExpr::Pack4x8(_, vec_expr) =>
+            gpu_expr_wf(vec_expr, n_locals, n_bufs),
+        GpuExpr::Unpack4x8(_, int_expr) =>
+            gpu_expr_wf(int_expr, n_locals, n_bufs),
+        GpuExpr::SubgroupReduce(_, val) =>
+            gpu_expr_wf(val, n_locals, n_bufs),
+        GpuExpr::SubgroupComm(_, val) =>
+            gpu_expr_wf(val, n_locals, n_bufs),
+        GpuExpr::SubgroupVote(_, val) =>
+            gpu_expr_wf(val, n_locals, n_bufs),
     }
 }
 
@@ -58,6 +92,18 @@ pub open spec fn gpu_stmt_wf(
             *buf < n_bufs
             && gpu_expr_wf(idx, n_locals, n_bufs)
             && gpu_expr_wf(val, n_locals, n_bufs),
+        GpuStmt::TextureStore { tex, coords, val } =>
+            *tex < n_bufs
+            && gpu_expr_wf(coords, n_locals, n_bufs)
+            && gpu_expr_wf(val, n_locals, n_bufs),
+        GpuStmt::AtomicRMW { buf, idx, op: _, val, old_val_var } =>
+            *buf < n_bufs
+            && gpu_expr_wf(idx, n_locals, n_bufs)
+            && gpu_expr_wf(val, n_locals, n_bufs)
+            && match old_val_var {
+                Option::Some(v) => *v < n_locals,
+                Option::None => true,
+            },
         GpuStmt::CallStmt { fn_id, args, result_var } =>
             *fn_id < n_fns
             && *result_var < n_locals
@@ -112,11 +158,12 @@ pub open spec fn gpu_function_wf(
 
 ///  A kernel is well-formed if its body and all functions are well-formed.
 pub open spec fn gpu_kernel_wf(k: &GpuKernel) -> bool {
+    let n_bufs = gpu_kernel_n_bufs(k);
     &&& k.n_locals > 0  //  at least locals[0] for thread ID
-    &&& gpu_stmt_wf(&k.body, k.n_locals, k.n_bufs, k.functions.len())
+    &&& gpu_stmt_wf(&k.body, k.n_locals, n_bufs, k.functions.len())
     &&& forall|i: int| 0 <= i < k.functions.len() ==>
             #[trigger] gpu_function_wf(
-                &k.functions[i], k.n_bufs, k.functions.len())
+                &k.functions[i], n_bufs, k.functions.len())
 }
 
 } // verus!

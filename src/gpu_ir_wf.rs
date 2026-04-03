@@ -42,7 +42,8 @@ pub open spec fn gpu_expr_wf(e: &GpuExpr, n_locals: nat, n_bufs: nat) -> bool
             gpu_expr_wf(inner, n_locals, n_bufs),
         GpuExpr::VecConstruct(components) =>
             components.len() >= 2 && components.len() <= 4
-            && gpu_args_wf(components, n_locals, n_bufs, 0),
+            && forall|i: int| 0 <= i < components.len() ==>
+                gpu_expr_wf(&components[i], n_locals, n_bufs),
         GpuExpr::VecComponent(vec_expr, idx) =>
             *idx < 4
             && gpu_expr_wf(vec_expr, n_locals, n_bufs),
@@ -52,7 +53,8 @@ pub open spec fn gpu_expr_wf(e: &GpuExpr, n_locals: nat, n_bufs: nat) -> bool
         GpuExpr::MatConstruct(cols, rows, col_exprs) =>
             *cols >= 2 && *cols <= 4 && *rows >= 2 && *rows <= 4
             && col_exprs.len() == *cols as int
-            && gpu_args_wf(col_exprs, n_locals, n_bufs, 0),
+            && forall|i: int| 0 <= i < col_exprs.len() ==>
+                gpu_expr_wf(&col_exprs[i], n_locals, n_bufs),
         GpuExpr::MatMul(a, b) =>
             gpu_expr_wf(a, n_locals, n_bufs)
             && gpu_expr_wf(b, n_locals, n_bufs),
@@ -107,7 +109,7 @@ pub open spec fn gpu_stmt_wf(
         GpuStmt::CallStmt { fn_id, args, result_var } =>
             *fn_id < n_fns
             && *result_var < n_locals
-            && gpu_args_wf(args, n_locals, n_bufs, 0),
+            && gpu_args_wf(args, n_locals, n_bufs),
         GpuStmt::Seq { first, then } =>
             gpu_stmt_wf(first, n_locals, n_bufs, n_fns)
             && gpu_stmt_wf(then, n_locals, n_bufs, n_fns),
@@ -130,15 +132,10 @@ pub open spec fn gpu_stmt_wf(
 
 ///  Check well-formedness of a Seq of call arguments.
 pub open spec fn gpu_args_wf(
-    args: &Seq<GpuExpr>, n_locals: nat, n_bufs: nat, idx: nat,
-) -> bool
-    decreases args.len() - idx,
-{
-    if idx >= args.len() { true }
-    else {
-        gpu_expr_wf(&args[idx as int], n_locals, n_bufs)
-        && gpu_args_wf(args, n_locals, n_bufs, idx + 1)
-    }
+    args: &Seq<GpuExpr>, n_locals: nat, n_bufs: nat,
+) -> bool {
+    forall|i: int| 0 <= i < args.len() ==>
+        gpu_expr_wf(&args[i], n_locals, n_bufs)
 }
 
 //  ══════════════════════════════════════════════════════════════

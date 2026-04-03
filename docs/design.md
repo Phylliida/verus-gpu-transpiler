@@ -173,19 +173,42 @@ satisfies its spec (standard Verus). The parser (trusted) connects them.
 ### 4.1 Types
 
 ```rust
+/// Type tag for GpuIR values — maps directly to WGSL types.
+pub enum GpuType { I32, U32, F32 }
+
 pub enum GpuBinOp {
+    // Integer arithmetic
     Add, Sub, Mul, Div, Mod, Shr,
+    // Comparisons (return i32: 1 or 0)
     Lt, Le, Gt, Ge, Eq, Ne,
+    // Bitwise (integer only)
     BitAnd, BitOr, BitXor,
+    // Float arithmetic (same names, dispatched by GpuType)
+    FAdd, FSub, FMul, FDiv,
 }
 
 pub enum GpuExpr {
-    Const(int),
+    Const(int),                                         // integer constant
+    FConst(f32),                                        // float constant
     Var(nat),                                           // locals[i]
     BinOp(GpuBinOp, Box<GpuExpr>, Box<GpuExpr>),
     Select(Box<GpuExpr>, Box<GpuExpr>, Box<GpuExpr>),  // c != 0 ? a : b
     ArrayRead(nat, Box<GpuExpr>),                       // bufs[arr][idx]
     Call(nat, Seq<GpuExpr>),                            // fn_table[id](args)
+    Cast(GpuType, Box<GpuExpr>),                        // type cast (e.g., i32 → f32)
+}
+
+/// Barrier scope — matches hardware synchronization primitives.
+pub enum BarrierScope {
+    /// workgroupBarrier() — all threads in workgroup sync.
+    /// Cheapest (~20 cycles). Most common.
+    Workgroup,
+    /// storageBarrier() — ensures storage buffer writes are visible
+    /// to subsequent reads within the workgroup.
+    Storage,
+    /// Subgroup-level barrier (warp sync). Not available in all
+    /// WGSL implementations; maps to __syncwarp() in CUDA.
+    Subgroup,
 }
 
 pub enum GpuStmt {
@@ -194,6 +217,7 @@ pub enum GpuStmt {
     Seq { first: Box<GpuStmt>, then: Box<GpuStmt> },
     If { cond: GpuExpr, then_body: Box<GpuStmt>, else_body: Box<GpuStmt> },
     For { var: nat, bound: GpuExpr, body: Box<GpuStmt> },
+    Barrier { scope: BarrierScope },
     Return,
     Noop,
 }
@@ -245,6 +269,12 @@ Key semantics:
 - `Seq`: eval first, then eval second (unless returned)
 - `If`: branch on `eval(cond) != 0`
 - `For`: bounded loop via `gpu_eval_loop` (mutual recursion, same as `eval_loop` in stage.rs)
+- `Barrier`: spec-level no-op on per-thread state (like Stage::Barrier).
+  The barrier's effect is at the *parallel* level — it's the point where
+  all threads' writes become visible. The Stage framework handles this:
+  a kernel body with Barrier nodes is decomposed into phases, and each
+  phase is verified independently for race freedom. The barrier scope
+  determines which threads synchronize (workgroup vs storage vs subgroup).
 - `Call`: substitute args into function body, eval, extract return value
 - `Return`: set `returned = true`
 
@@ -408,6 +438,55 @@ allocation, recursion, unbounded loops, pattern matching.
 #[gpu_shared]                              // workgroup shared memory
 ```
 
+Barriers are called directly in kernel code with explicit scope:
+
+```rust
+gpu_workgroup_barrier();   // workgroupBarrier() — sync all threads in workgroup
+gpu_storage_barrier();     // storageBarrier() — flush storage buffer writes
+gpu_subgroup_barrier();    // subgroup barrier (warp sync)
+```
+
+The scope matters for both correctness and performance:
+- Workgroup barrier: all threads in the workgroup reach the barrier before
+  any proceed. Shared memory writes become visible. ~20 cycles.
+- Storage barrier: storage buffer writes become visible to subsequent reads
+  within the workgroup. No thread synchronization.
+- Subgroup barrier: threads within a subgroup (warp) synchronize. Cheapest
+  but smallest scope.
+
+Example with barriers:
+
+```rust
+#[gpu_kernel(workgroup_size(256))]
+fn reduce_kernel(
+    #[gpu_builtin(thread_id_x)] tid: u32,
+    #[gpu_buffer(0, read)] input: &[f32],
+    #[gpu_buffer(1, read_write)] output: &mut [f32],
+    #[gpu_shared] smem: &mut [f32; 256],
+)
+    requires tid < 256
+{
+    smem[tid] = input[tid];
+    gpu_workgroup_barrier();     // all threads have written to smem
+
+    // tree reduction
+    let mut stride: u32 = 128;
+    while stride > 0
+        invariant /* partial reduction correct for current stride */
+    {
+        if tid < stride {
+            smem[tid] = smem[tid] + smem[tid + stride];
+        }
+        gpu_workgroup_barrier(); // all threads see updated smem
+        stride = stride / 2;
+    }
+
+    if tid == 0 {
+        output[0] = smem[0];
+    }
+}
+```
+
 These are Rust outer attributes — Verus ignores them (treats as custom
 attributes), the transpiler front-end reads them.
 
@@ -506,39 +585,123 @@ satisfies the same spec.
 - naga/tint: WGSL → SPIR-V
 - GPU driver + silicon
 
+### D5: Float support — NATIVE f32 via Verus
+
+**Tested (2026-04-03):** Verus supports f32/f64 natively. Results:
+
+| Level | f32 support | Status |
+|-------|------------|--------|
+| Spec | Full arithmetic (`+`, `*`, `-`, `/`), sequences, recursive specs | Works |
+| Proof | Bit representation (`to_bits_spec`), finiteness, NaN/infinity | Works |
+| Exec | Passthrough (assign, return) | Works |
+| Exec arithmetic | `a + b` requires `add_req` precondition; result is nondeterministic (IEEE rounding modes) | Works with precondition |
+
+**Design**: GpuIR supports both integer and float types natively. The GpuExpr
+type uses `GpuType { I32, U32, F32 }` tags. At the spec level, float
+arithmetic is fully available for writing specs (dot products, GEMM
+accumulation, etc.). At the exec level, float arithmetic goes through Verus's
+`add_req`/`mul_req` preconditions — the user must prove the operation is
+well-defined (e.g., finite operands). Float results are nondeterministic
+at the exec level (IEEE rounding), which is faithful to hardware.
+
+This means: users can write f32 GPU kernels, specify exact mathematical
+behavior in ensures clauses using spec-level f32 arithmetic, and verify that
+their index computations / buffer accesses / race freedom are correct. The
+numerical precision of float ops is trusted (hardware-faithful), not verified.
+
+### D6: Shared memory — FAITHFUL TO HARDWARE
+
+Principle: model what the hardware actually does. Don't abstract away details.
+Users should be able to reason about bank conflicts and precise memory layout.
+
+**Model**: Shared memory is modeled as a flat buffer in GpuState (same as
+global buffers, but with `#[gpu_shared]` annotation). Barrier semantics:
+
+```rust
+// Before barrier: each thread sees only its own writes to shared memory
+// After barrier: all threads' writes become visible
+// This matches __syncthreads() / workgroupBarrier() exactly
+```
+
+**Spec-level model**: The Stage framework's existing barrier-interval analysis
+applies directly. Between barriers, shared memory reads see the pre-barrier
+snapshot. After a barrier, the declarative `map_output_declarative` spec
+gives the post-barrier state.
+
+**User obligations**: The user must prove:
+1. No data races on shared memory within a barrier interval
+2. Shared memory accesses are in bounds (array size is compile-time known)
+3. Bank conflict freedom (optional — for performance, not correctness)
+
+We provide library lemmas for common patterns (e.g., "linear tid access
+to shared memory is race-free and bank-conflict-free").
+
+### D7: Race freedom — USER PROVES IT
+
+Principle: more user proofs = more correctness. The user must prove race
+freedom for every buffer write, not rely on inference.
+
+**Mechanism**: For each `#[gpu_kernel]` function that writes to buffers, the
+user writes a companion `proof fn` establishing scatter injectivity:
+
+```rust
+#[gpu_kernel(workgroup_size(256))]
+fn my_kernel(
+    #[gpu_builtin(thread_id_x)] tid: u32,
+    #[gpu_buffer(0, read_write)] out: &mut [i32],
+) { ... }
+
+proof fn my_kernel_race_free(tid1: nat, tid2: nat)
+    requires tid1 != tid2, tid1 < 256, tid2 < 256
+    ensures
+        // write index for tid1 != write index for tid2
+        write_index(tid1) != write_index(tid2)
+{ ... }
+```
+
+For multi-barrier kernels, race freedom must be proved per barrier interval.
+The Stage framework provides the compositional reasoning structure.
+
+**Library support**: We provide verified helper lemmas for common patterns:
+- `lemma_identity_scatter_injective` — tid → tid writes are race-free
+- `lemma_strided_scatter_injective` — tid*stride+offset writes are race-free
+- `lemma_tiled_scatter_injective` — tiled GEMM output patterns
+
+### D8: Front-end tooling — MCP + CLI
+
+Both paths:
+1. **MCP tool**: `verus_transpile("kernel.rs")` — integrated into the
+   development workflow via verus-mcp
+2. **CLI**: `verus-gpu-transpile kernel.rs -o kernel.wgsl` — for build scripts
+   and CI
+
+Both use the same tree-sitter front-end + GpuIR construction internally.
+
 ---
 
 ## 9. Open Questions
 
-### Q1: Shared memory model
+### D9: Type tags — CARRY ON EVERY NODE
 
-The Stage model uses buffers in SharedState. In Verus code, shared memory is
-`&mut [i32; N]`. How do we model "pre-barrier snapshot" semantics?
-- Ghost snapshots (existing pattern from verus-topology)
-- Require `let snap = smem@;` in proof code
-- Model as separate buffer in GpuState (cleanest?)
+GpuExpr carries `GpuType` on every node. Simplifies the emit proof (each
+node knows its WGSL type) and matches WGSL's explicitly-typed semantics.
+The parser infers types from the Verus source and tags each node.
 
-### Q2: Float support
+### D10: No automatic behavior — EVERYTHING EXPLICIT
 
-Verus doesn't support f32/f64. Options:
-- Opaque float ops in GpuIR (verify index/memory safety, axiomatize arithmetic)
-- Fixed-point only (existing approach)
-- External-body wrappers with stated properties (e.g., monotonicity, bounds)
+No implicit transformations, no auto-splitting, no inference of patterns.
+The user writes exactly what they mean. The parser does a 1:1 structural
+translation from Verus source to GpuIR. If the user wants a barrier, they
+write `gpu_workgroup_barrier()`. If they want a type cast, they write
+`x as f32`.
 
-### Q3: How does the front-end work in practice?
+### D11: No while loops — FOR ONLY
 
-Options:
-- (a) CLI tool: `verus-gpu-transpile kernel.rs -o kernel.wgsl`
-- (b) Verus build plugin
-- (c) MCP integration: `verus_transpile("kernel.rs")`
-
-### Q4: Race freedom extraction
-
-Extracting write indices from GpuStmt (with control flow) is more complex than
-from ArithExpr scatter expressions. Options:
-- Infer write pattern from GpuStmt structure automatically
-- Require user to annotate scatter pattern explicitly
-- Require user to prove race freedom as a separate proof fn (most flexible)
+GPU hardware has no concept of unbounded iteration. Infinite loops are
+undefined behavior in WGSL. Only bounded `for` loops are supported:
+`for i in 0..n { ... }`. The user provides the bound explicitly. This is
+faithful to hardware and simplifies the GpuIR eval semantics (termination
+is trivially guaranteed by the bound).
 
 ---
 

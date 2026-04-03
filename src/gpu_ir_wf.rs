@@ -22,7 +22,7 @@ pub open spec fn gpu_expr_wf(e: &GpuExpr, n_locals: nat, n_bufs: nat) -> bool
         GpuExpr::Const(_, _) => true,
         GpuExpr::FConst(_) => true,
         GpuExpr::Var(i, _) => *i < n_locals,
-        GpuExpr::Builtin(_) => true,
+        GpuExpr::Builtin { which: _, local_idx } => *local_idx < n_locals,
         GpuExpr::BinOp(_, a, b) =>
             gpu_expr_wf(a, n_locals, n_bufs)
             && gpu_expr_wf(b, n_locals, n_bufs),

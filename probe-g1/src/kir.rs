@@ -31,6 +31,26 @@ pub open spec fn ltu(x: u32, y: u32) -> u32 {
     if x < y { 1u32 } else { 0u32 }
 }
 
+/// Wrapping u32 subtract: Euclidean mod keeps the result in [0, 2^32).
+pub open spec fn wsub(x: u32, y: u32) -> u32 {
+    (((x as int) - (y as int)) % kwrap()) as u32
+}
+
+/// Wrapping u32 multiply.
+pub open spec fn wmul(x: u32, y: u32) -> u32 {
+    (((x as int) * (y as int)) % kwrap()) as u32
+}
+
+/// (x >= y) as 0/1.
+pub open spec fn geu(x: u32, y: u32) -> u32 {
+    if x >= y { 1u32 } else { 0u32 }
+}
+
+/// (x <= y) as 0/1.
+pub open spec fn leu(x: u32, y: u32) -> u32 {
+    if x <= y { 1u32 } else { 0u32 }
+}
+
 /// KIR expressions (probe fragment).
 pub enum KExpr {
     /// Literal constant.
@@ -45,6 +65,16 @@ pub enum KExpr {
     AddW(Box<KExpr>, Box<KExpr>),
     /// (lhs < rhs) as 0/1.
     LtU(Box<KExpr>, Box<KExpr>),
+    /// Wrapping u32 subtract.
+    SubW(Box<KExpr>, Box<KExpr>),
+    /// Wrapping u32 multiply.
+    MulW(Box<KExpr>, Box<KExpr>),
+    /// (lhs >= rhs) as 0/1.
+    GeU(Box<KExpr>, Box<KExpr>),
+    /// (lhs <= rhs) as 0/1.
+    LeU(Box<KExpr>, Box<KExpr>),
+    /// Branchless conditional: cond != 0 picks the second argument.
+    Select(Box<KExpr>, Box<KExpr>, Box<KExpr>),
 }
 
 /// KIR statements (probe fragment).
@@ -85,6 +115,17 @@ pub open spec fn keval(e: KExpr, st: KState, a: Seq<u32>, b: Seq<u32>) -> u32
         },
         KExpr::AddW(x, y) => wadd(keval(*x, st, a, b), keval(*y, st, a, b)),
         KExpr::LtU(x, y) => ltu(keval(*x, st, a, b), keval(*y, st, a, b)),
+        KExpr::SubW(x, y) => wsub(keval(*x, st, a, b), keval(*y, st, a, b)),
+        KExpr::MulW(x, y) => wmul(keval(*x, st, a, b), keval(*y, st, a, b)),
+        KExpr::GeU(x, y) => geu(keval(*x, st, a, b), keval(*y, st, a, b)),
+        KExpr::LeU(x, y) => leu(keval(*x, st, a, b), keval(*y, st, a, b)),
+        KExpr::Select(c, t, e) => {
+            if keval(*c, st, a, b) != 0 {
+                keval(*t, st, a, b)
+            } else {
+                keval(*e, st, a, b)
+            }
+        },
     }
 }
 

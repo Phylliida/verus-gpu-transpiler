@@ -100,3 +100,39 @@ this schema. Start with straight-line kernels (protolith `sum_sq3`,
 `wrap_delta`, `torus_dist2`), then the loop template. The probe's
 `certificate.rs` is the golden reference for what generated output should
 look like.
+
+---
+
+# Addendum — G1a: the generator exists (2026-07-16, same day)
+
+**`kirgen/` (plain Rust, zero deps, one reviewable file) generated
+`probe-g1/src/gen_certs.rs` (536 lines), and the crate went to
+52 verified, 0 errors on the first generation run — no hand edits to
+generated output, no template tuning.**
+
+Kernels certified (real protolith kernel shapes, certificates target the
+verbatim spec fns): `abs_delta` (Select + SubW), `wrap_delta` (three
+statements, nested Select, the n−d seam), `sum_sq3` (MulW with generated
+nlinarith range-bound asserts). New discharge shapes beyond the probe —
+Select, wrapping sub/mul, generated seam blocks — all closed by the same
+five-shape schema with `nlinarith` added to the arithmetic cascade.
+
+**Design discovery worth recording:** for kernels carrying exact functional
+postconditions (every protolith kernel does — house style), the certificate
+targets the *spec fn*, and the chain `exec == spec` (already verified in the
+source crate) `== KIR` (generated) is complete **without SST reflection**.
+Reflection is thereby demoted from G1 blocker to an optimization for kernels
+lacking functional specs. The kernel-safe subset (DESIGN §4.1) should simply
+require exact functional postconditions.
+
+The generator's input seam (typed kernel AST, hand-encoded in `main.rs`) is
+what the fork's SST adapter replaces. Transcription errors at this seam are
+caught by verification: every certificate's ensures references the real
+`spec_kernels::*` fn by name, so a mis-encoded kernel fails its own
+certificate. (Residual: contradictory `requires` would make a certificate
+vacuous — the requires mirror protolith's visibly-satisfiable preconditions;
+a generated witness-instantiation check is cheap future hardening.)
+
+Remaining for full G1: loop-kernel emission (schema hand-proven in
+`certificate.rs`, needs templating into kirgen), the SST adapter in the fork,
+cross-crate generation (certificates importing protolith directly).

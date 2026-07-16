@@ -10,3 +10,5 @@
 pub mod kir;
 pub mod addloop;
 pub mod certificate;
+pub mod spec_kernels;
+pub mod gen_certs;

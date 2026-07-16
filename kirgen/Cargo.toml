@@ -1,0 +1,9 @@
+[package]
+name = "kirgen"
+version = "0.1.0"
+edition = "2021"
+description = "KIR certificate generator (G1a): typed kernel AST -> verified certificate module"
+
+[[bin]]
+name = "kirgen"
+path = "src/main.rs"

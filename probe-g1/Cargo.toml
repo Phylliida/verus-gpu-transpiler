@@ -1,0 +1,14 @@
+[package]
+name = "probe-g1"
+version = "0.1.0"
+edition = "2021"
+description = "G1 discharge-automation probe: KIR certificate bisimulation for add_limbs (DESIGN.md §5.2 gate)"
+
+[dependencies]
+vstd = { path = "../../tactus/source/vstd" }
+
+[package.metadata.verus]
+verify = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_keep_ghost)'] }

@@ -136,3 +136,32 @@ a generated witness-instantiation check is cheap future hardening.)
 Remaining for full G1: loop-kernel emission (schema hand-proven in
 `certificate.rs`, needs templating into kirgen), the SST adapter in the fork,
 cross-crate generation (certificates importing protolith directly).
+
+---
+
+# Addendum — G1b: loop-kernel templating (2026-07-16, same day)
+
+**kirgen now emits the full loop schema. The generated `add_limbs`
+certificate — model spec fns, 4 model unfolds, 7 sequencing unfolds, 8
+per-statement lemmas, composed step bisimulation, loop induction — verified
+on its first generation run (crate: 75 verified, 0 errors; gen_certs.rs is
+now 1,138 generated lines from an 8-line typed kernel definition).**
+
+Notable design point: the generated model uses the same wrapping ops as the
+KIR side (both come from one AST), so the model-connection asserts are
+near-definitional and the arithmetic seam moves to the source-side ensures
+(`exec fn ensures out@ == model_out_*`), where it belongs. The generated
+`model_out_*`/`model_c0_*` recursive spec fns are the kernel's canonical
+functional spec — readable, reviewable, and the anchor point for source
+exec fns.
+
+v1 loop restrictions (enforced by generator panics, lifted as needed):
+single carried register, single counter-indexed WriteOut, counter-only
+buffer indexing, counter not used arithmetically. Honest gap: the generated
+model is not yet anchored to an independently-written source proof for
+add_limbs specifically (the hand probe's addloop model plays that role
+morally; a model-equivalence lemma or a source exec fn ensuring against the
+generated model closes it — that is the cross-crate/source-side step).
+
+G1 remaining: SST adapter in the fork (replaces the typed-AST seam),
+cross-crate emission, offsets, multi-carried/multi-write generalization.
